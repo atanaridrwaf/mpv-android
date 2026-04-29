@@ -185,6 +185,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var smoothSeekGesture = false
     /* * */
 
+    // mpv decodes many still-image formats (JPEG/WebP/PNG/etc.) as a single video frame.
+    // For 4:2:0 JPEG scans with very high-frequency print/halftone detail, keeping the
+    // frame in a subsampled YUV format until the VO stage can produce obvious green/magenta
+    // chroma aliasing while zooming or fitting the image to a small phone display.
+    //
+    // Android gallery apps typically decode images to an RGB bitmap first and scale that RGB
+    // bitmap. Do the same for mpv still-image tracks only: expand chroma to full-resolution
+    // RGBA in the software video-filter chain, then let vo=gpu/gpu-next scale a packed RGB
+    // image instead of scaling separate luma/chroma planes.
+    private var androidImageRgbFilterActive = false
+
     @SuppressLint("ClickableViewAccessibility")
     private fun initListeners() {
         with (binding) {
@@ -1855,6 +1866,50 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     // mpv events
 
+    private fun removeAndroidImageRgbFilter(reason: String) {
+        // Run the remove command even if our boolean says it is inactive. This makes the
+        // cleanup robust if mpv drops/rebuilds the filter chain during a file transition.
+        MPVLib.command(arrayOf("vf", "remove", ANDROID_IMAGE_RGB_FILTER_LABEL))
+        if (androidImageRgbFilterActive)
+            Log.v(TAG, "Disabled still-image RGB conversion filter ($reason)")
+        androidImageRgbFilterActive = false
+    }
+
+    private fun enableAndroidImageRgbFilter(reason: String) {
+        if (androidImageRgbFilterActive)
+            return
+
+        val pixfmt = MPVLib.getPropertyString("video-params/pixelformat") ?: "unknown"
+        val codec = MPVLib.getPropertyString("video-codec") ?: "unknown"
+        Log.i(TAG, "Still-image RGB conversion filter enabled " +
+                   "($reason, codec=$codec, pixfmt=$pixfmt)")
+
+        // Avoid duplicates if mpv already has a stale filter with this label.
+        MPVLib.command(arrayOf("vf", "remove", ANDROID_IMAGE_RGB_FILTER_LABEL))
+        MPVLib.command(arrayOf("vf", "add", ANDROID_IMAGE_RGB_FILTER))
+        androidImageRgbFilterActive = true
+    }
+
+    private fun looksLikeStillImagePath(path: String?): Boolean {
+        if (path.isNullOrBlank())
+            return false
+        val cleanPath = path.substringBefore('?').substringBefore('#').lowercase()
+        return STILL_IMAGE_EXTENSIONS.any { cleanPath.endsWith(".$it") }
+    }
+
+    private fun updateAndroidImageRgbFilter(reason: String) {
+        val image = MPVLib.getPropertyString("current-tracks/video/image")
+        val isStillImage = image == "yes" || image == "true"
+
+        if (!isStillImage) {
+            if (androidImageRgbFilterActive)
+                removeAndroidImageRgbFilter(reason)
+            return
+        }
+
+        enableAndroidImageRgbFilter(reason)
+    }
+
     private fun eventPropertyUi(property: String, dummy: Any?, metaUpdated: Boolean) {
         if (!activityIsForeground) return
         when (property) {
@@ -1921,6 +1976,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             })
         } else if (property == "current-tracks/audio/selected") {
             updateAudioPresence()
+        } else if (property == "current-tracks/video/image") {
+            updateAndroidImageRgbFilter("track image property changed")
         }
 
         if (property == "pause" || property == "current-tracks/audio/selected")
@@ -1985,6 +2042,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             finishWithResult(if (playbackHasStarted) RESULT_OK else RESULT_CANCELED)
 
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
+            removeAndroidImageRgbFilter("new file")
+            if (looksLikeStillImagePath(MPVLib.getPropertyString("path")))
+                enableAndroidImageRgbFilter("path extension")
+
             val cmds = onloadCommands.toTypedArray()
             onloadCommands.clear()
             for (c in cmds)
@@ -1995,6 +2056,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
             playbackHasStarted = true
         }
+
+        if (eventId == MpvEvent.MPV_EVENT_FILE_LOADED)
+            updateAndroidImageRgbFilter("file loaded")
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventUi(eventId) }
@@ -2130,5 +2194,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
         // precision used by seekbar (1/s)
         private const val SEEK_BAR_PRECISION = 2
+        private const val ANDROID_IMAGE_RGB_FILTER_LABEL = "@android-image-rgb"
+        private const val ANDROID_IMAGE_RGB_FILTER = "@android-image-rgb:format=fmt=rgba"
+        private val STILL_IMAGE_EXTENSIONS = setOf(
+            "jpg", "jpeg", "jpe", "png", "webp", "bmp", "gif",
+            "avif", "heic", "heif", "tif", "tiff"
+        )
     }
 }
