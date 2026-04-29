@@ -1,6 +1,7 @@
 package `is`.xyz.mpv
 
 import android.content.Context
+import android.graphics.PixelFormat
 import android.util.AttributeSet
 import android.util.Log
 import android.view.SurfaceHolder
@@ -9,6 +10,20 @@ import android.view.SurfaceView
 // Contains only the essential code needed to get a picture on the screen
 
 abstract class BaseMPVView(context: Context, attrs: AttributeSet) : SurfaceView(context, attrs), SurfaceHolder.Callback {
+    init {
+        /*
+         * libmpv renders directly into this Surface through the Android
+         * native window. If the holder is left at PixelFormat.OPAQUE, some
+         * devices are allowed to allocate an RGB_565/low-precision producer
+         * surface. That quantizes each rendered frame before composition and
+         * produces green/magenta moire on high-frequency printed scans.
+         *
+         * Request an explicit 8-bit-per-channel window format before the
+         * Surface is created so mpv/EGL gets a true 32-bit render target.
+         */
+        holder.setFormat(PixelFormat.RGBX_8888)
+    }
+
     /**
      * Initialize libmpv.
      *
