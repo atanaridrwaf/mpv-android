@@ -41,7 +41,17 @@ jobs:
         run: |
           buildscripts/include/ci.sh build
 
+      - name: Verify APK
+        run: |
+          apk=app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
+          if [ ! -f "$apk" ]; then
+            echo "Error: expected APK not found"
+            ls -la app/build/outputs/apk/default/release/ || true
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v7
         with:
           name: mpv-android
-          path: app/build/outputs/apk/default/debug/app-default-armeabi-v7a-debug.apk
+          path: app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk
+          if-no-files-found: error
