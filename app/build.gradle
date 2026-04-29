@@ -22,10 +22,6 @@ android {
         "default" {
             isDefault true
         }
-        api29 {
-            targetSdkVersion 29
-            versionNameSuffix "-oldapi"
-        }
     }
 
     buildFeatures {
@@ -33,16 +29,18 @@ android {
         buildConfig = true
     }
 
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+        }
+    }
+
     splits {
         abi {
             enable true
             reset()
-            // include only the ABIs that were actually built
-            project.ext.abiCodes.each { abi, _ ->
-                if (new File(project.projectDir, "src/main/jniLibs/${abi}").exists())
-                    include(abi)
-            }
-            universalApk true // build an APK with all ABIs too
+            include "arm64-v8a"
+            universalApk false
         }
     }
 }
