@@ -39,27 +39,19 @@ fi
 PREFIX32=$prefix32 PREFIX64=$prefix64 PREFIX_X64=$prefix_x64 PREFIX_X86=$prefix_x86 \
 ndk-build -C app/src/main -j$cores
 
-targets=(assembleDebug)
-if [ -z "$DONT_BUILD_RELEASE" ]; then
-	targets+=(assembleRelease)
-	[ -n "$BUNDLE" ] && targets+=(bundleRelease)
-fi
+targets=(assembleDefaultRelease)
+[ -n "$BUNDLE" ] && targets+=(bundleDefaultRelease)
 ./gradlew "${targets[@]}"
 
 if [ -n "$ANDROID_SIGNING_KEY" ]; then
-	cd "${MPV_ANDROID}/app/build/outputs/apk"
+	cd "${MPV_ANDROID}/app/build/outputs/apk/default/release"
 	apksigner=${ANDROID_HOME}/build-tools/${v_sdk_build_tools}/apksigner
-	for v in default api29; do
-		pushd $v
-		# sign the universal debug APK
+	for apk in *.apk; do
+		case "$apk" in
+			*-signed.apk|*-aligned.apk) continue ;;
+		esac
 		"$apksigner" sign --ks "${ANDROID_SIGNING_KEY}" \
-			--in debug/app-$v-universal-debug.apk --out debug/app-$v-universal-debug-signed.apk
-		# but all of the release APKs
-		for apk in release/*-unsigned.apk; do
-			"$apksigner" sign --ks "${ANDROID_SIGNING_KEY}" \
-				--in $apk --out ${apk/-unsigned/-signed}
-		done
-		popd
+			--in "$apk" --out "${apk/.apk/-signed.apk}"
 	done
 	# and the bundle
 	cd ../bundle
