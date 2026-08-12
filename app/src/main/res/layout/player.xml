@@ -10,11 +10,28 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!--
+        Gesture layer.
+
+        IMPORTANT: This view must not be transformed.
+        We apply zoom/pan transforms to the SurfaceView (player) itself.
+        If we attached gesture handling directly to the transformed SurfaceView,
+        Android would deliver touch coordinates that are continuously re-mapped
+        by the inverse transform matrix, causing feedback/jitter while zooming/panning.
+    -->
+    <View
+        android:id="@+id/gestureLayer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent"
+        android:elevation="1dp" />
+
     <!-- so that insets can be applied as margins -->
     <RelativeLayout
         android:id="@+id/outside"
         android:layout_width="match_parent"
-        android:layout_height="match_parent">
+        android:layout_height="match_parent"
+        android:elevation="2dp">
 
         <LinearLayout
             android:id="@+id/controls"
