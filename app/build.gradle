@@ -2,6 +2,7 @@ apply plugin: 'com.android.application'
 
 ext.abiCodes = ["armeabi-v7a": 1, "arm64-v8a": 2, "x86":3, "x86_64":4]
 ext.universalBase = 8000
+def githubActionsArm64ReleaseOnly = System.getenv("MPV_ANDROID_GITHUB_ACTIONS_ARM64_RELEASE_ONLY") in ["1", "true"]
 
 android {
     namespace 'is.xyz.mpv'
@@ -33,16 +34,30 @@ android {
         buildConfig = true
     }
 
+    variantFilter { variant ->
+        if (githubActionsArm64ReleaseOnly) {
+            def isDefaultRelease = variant.buildType.name == "release" &&
+                    variant.flavors*.name.contains("default")
+            if (!isDefaultRelease) {
+                setIgnore(true)
+            }
+        }
+    }
+
     splits {
         abi {
             enable true
             reset()
-            // include only the ABIs that were actually built
-            project.ext.abiCodes.each { abi, _ ->
-                if (new File(project.projectDir, "src/main/jniLibs/${abi}").exists())
-                    include(abi)
+            if (githubActionsArm64ReleaseOnly) {
+                include "arm64-v8a"
+            } else {
+                // include only the ABIs that were actually built
+                project.ext.abiCodes.each { abi, _ ->
+                    if (new File(project.projectDir, "src/main/jniLibs/${abi}").exists())
+                        include(abi)
+                }
             }
-            universalApk true // build an APK with all ABIs too
+            universalApk !githubActionsArm64ReleaseOnly // CI release-only builds must not create a universal APK
         }
     }
 }
