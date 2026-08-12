@@ -1127,12 +1127,26 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var lockedUI = false
 
     private fun pauseForDialog(): StateRestoreCallback {
-        // Keep playback running while UI dialogs/menus are open.
-        // We still set keep-open so mpv doesn't exit at EOF while the user is interacting with UI.
-        val oldValue = MPVLib.getPropertyString("keep-open")
-        MPVLib.setPropertyBoolean("keep-open", true)
+        val useKeepOpen = when (noUIPauseMode) {
+            "always" -> true
+            "audio-only" -> isPlayingAudioOnly()
+            else -> false // "never"
+        }
+        if (useKeepOpen) {
+            // don't pause but set keep-open so mpv doesn't exit while the user is doing stuff
+            val oldValue = MPVLib.getPropertyString("keep-open")
+            MPVLib.setPropertyBoolean("keep-open", true)
+            return {
+                oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
+            }
+        }
+
+        // Pause playback during UI dialogs
+        val wasPlayerPaused = player.paused ?: true
+        player.paused = true
         return {
-            oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
+            if (!wasPlayerPaused)
+                player.paused = false
         }
     }
 
