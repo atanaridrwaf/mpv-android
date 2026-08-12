@@ -56,9 +56,13 @@ android {
 // e.g. x86 with version 21 gets a versionCode of 3021
 import com.android.build.api.variant.FilterConfiguration
 androidComponents {
-    beforeVariants(selector().all()) { variant ->
-        if (githubActionsArm64ReleaseOnly && variant.name != "defaultRelease") {
-            variant.enable = false
+    beforeVariants(selector().all()) { variantBuilder ->
+        if (githubActionsArm64ReleaseOnly) {
+            def isDefaultRelease = variantBuilder.buildType == "release" &&
+                    variantBuilder.productFlavors*.second.contains("default")
+            if (!isDefaultRelease) {
+                variantBuilder.enable = false
+            }
         }
     }
 
