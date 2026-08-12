@@ -4,6 +4,7 @@
 #include <time.h>
 #include <locale.h>
 #include <atomic>
+#include <stdint.h>
 
 #include <mpv/client.h>
 
@@ -25,6 +26,8 @@ extern "C" {
     jni_func(void, destroy);
 
     jni_func(void, command, jobjectArray jarray);
+    jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
+    jni_func(void, abortAsyncCommand, jlong userdata);
 };
 
 JavaVM *g_vm;
@@ -117,3 +120,33 @@ jni_func(void, command, jobjectArray jarray) {
         env->DeleteLocalRef(strings[i]);
     }
 }
+
+jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
+    CHECK_MPV_INIT();
+
+    const char *arguments[128] = {0};
+    jstring jstrings[128] = {0};
+    int len = env->GetArrayLength(jarray);
+    if (len >= ARRAYLEN(arguments))
+        die("too many command arguments");
+
+    for (int i = 0; i < len; ++i) {
+        jstrings[i] = (jstring)env->GetObjectArrayElement(jarray, i);
+        arguments[i] = env->GetStringUTFChars(jstrings[i], NULL);
+    }
+
+    int err = mpv_command_async(g_mpv, (uint64_t)userdata, arguments);
+
+    for (int i = 0; i < len; ++i) {
+        env->ReleaseStringUTFChars(jstrings[i], arguments[i]);
+        env->DeleteLocalRef(jstrings[i]);
+    }
+
+    return err;
+}
+
+jni_func(void, abortAsyncCommand, jlong userdata) {
+    CHECK_MPV_INIT();
+    mpv_abort_async_command(g_mpv, (uint64_t)userdata);
+}
+

@@ -40,9 +40,22 @@ static void sendPropertyUpdateToJava(JNIEnv *env, mpv_event_property *prop)
         env->DeleteLocalRef(jvalue);
 }
 
+static void sendCommandReplyToJava(JNIEnv *env, const mpv_event *event)
+{
+    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_eventCommandReply_li,
+        (jlong) event->reply_userdata, (jint) event->error);
+}
+
 static void sendEventToJava(JNIEnv *env, int event)
 {
     env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_event, event);
+}
+
+static void sendEndFileEventToJava(JNIEnv *env, mpv_event_end_file *event)
+{
+    const bool reached_eof = event && event->reason == MPV_END_FILE_REASON_EOF;
+    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_eventEndFile_b,
+        (jboolean) reached_eof);
 }
 
 static void sendLogMessageToJava(JNIEnv *env, mpv_event_log_message *msg)
@@ -97,6 +110,19 @@ void *event_thread(void *arg)
         case MPV_EVENT_PROPERTY_CHANGE:
             mp_property = (mpv_event_property*)mp_event->data;
             sendPropertyUpdateToJava(env, mp_property);
+            break;
+        case MPV_EVENT_END_FILE:
+            ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
+            sendEndFileEventToJava(env, (mpv_event_end_file*)mp_event->data);
+            break;
+        case MPV_EVENT_COMMAND_REPLY:
+            ALOGV("event: %s userdata=%llu error=%d\n",
+                mpv_event_name(mp_event->event_id),
+                (unsigned long long) mp_event->reply_userdata,
+                mp_event->error);
+            sendCommandReplyToJava(env, mp_event);
+            // Preserve the generic event callback for any existing observers.
+            sendEventToJava(env, mp_event->event_id);
             break;
         default:
             ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
