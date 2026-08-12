@@ -34,16 +34,6 @@ android {
         buildConfig = true
     }
 
-    variantFilter { variant ->
-        if (githubActionsArm64ReleaseOnly) {
-            def isDefaultRelease = variant.buildType.name == "release" &&
-                    variant.flavors*.name.contains("default")
-            if (!isDefaultRelease) {
-                setIgnore(true)
-            }
-        }
-    }
-
     splits {
         abi {
             enable true
@@ -66,6 +56,12 @@ android {
 // e.g. x86 with version 21 gets a versionCode of 3021
 import com.android.build.api.variant.FilterConfiguration
 androidComponents {
+    beforeVariants(selector().all()) { variant ->
+        if (githubActionsArm64ReleaseOnly && variant.name != "defaultRelease") {
+            variant.enable = false
+        }
+    }
+
     onVariants(selector().all()) { variant ->
         variant.outputs.forEach { output ->
             def abiName = output.filters.find { it.filterType == FilterConfiguration.FilterType.ABI }?.identifier
