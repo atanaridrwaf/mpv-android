@@ -36,6 +36,17 @@ class FilePickerActivity : AppCompatActivity(), AbstractFilePickerFragment.OnFil
 
     private var documentOpener = registerForActivityResult(ActivityResultContracts.OpenDocument()) {
         it?.let { uri ->
+            // External subtitle/audio files are restored on later app launches. Retain the SAF
+            // read grant now; forwarding only the URI string would otherwise leave mpv with a
+            // path it can no longer open after this temporary picker grant expires.
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Could not persist read permission for $uri", e)
+            }
             finishWithResult(RESULT_OK, uri.toString())
         }
     }

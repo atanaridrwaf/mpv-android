@@ -22,6 +22,8 @@ object MPVLib {
     external fun detachSurface()
 
     external fun command(cmd: Array<out String>)
+    external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
+    external fun abortAsyncCommand(userdata: Long)
 
     external fun setOptionString(name: String, value: String): Int
 
@@ -95,10 +97,26 @@ object MPVLib {
     }
 
     @JvmStatic
+    fun eventCommandReply(userdata: Long, error: Int) {
+        synchronized(observers) {
+            for (o in observers)
+                o.eventCommandReply(userdata, error)
+        }
+    }
+
+    @JvmStatic
     fun event(eventId: Int) {
         synchronized(observers) {
             for (o in observers)
                 o.event(eventId)
+        }
+    }
+
+    @JvmStatic
+    fun eventEndFile(reachedEof: Boolean) {
+        synchronized(observers) {
+            for (o in observers)
+                o.eventEndFile(reachedEof)
         }
     }
 
@@ -132,7 +150,11 @@ object MPVLib {
         fun eventProperty(property: String, value: Boolean)
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
+        fun eventCommandReply(userdata: Long, error: Int) {}
         fun event(eventId: Int)
+        fun eventEndFile(reachedEof: Boolean) {
+            event(MpvEvent.MPV_EVENT_END_FILE)
+        }
     }
 
     interface LogObserver {

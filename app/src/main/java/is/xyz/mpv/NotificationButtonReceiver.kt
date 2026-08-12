@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.preference.PreferenceManager
 import android.util.Log
 import androidx.core.app.PendingIntentCompat
 
@@ -14,9 +15,30 @@ class NotificationButtonReceiver : BroadcastReceiver() {
         // remember to update AndroidManifest.xml too when adding here
         when (intent.action) {
             "$PREFIX.PLAY_PAUSE" -> MPVLib.command(arrayOf("cycle", "pause"))
-            "$PREFIX.ACTION_PREV" -> MPVLib.command(arrayOf("playlist-prev"))
-            "$PREFIX.ACTION_NEXT" -> MPVLib.command(arrayOf("playlist-next"))
+            "$PREFIX.ACTION_PREV" -> {
+                persistBeforePlaylistJump(context)
+                MPVLib.command(arrayOf("playlist-prev"))
+            }
+            "$PREFIX.ACTION_NEXT" -> {
+                persistBeforePlaylistJump(context)
+                MPVLib.command(arrayOf("playlist-next"))
+            }
         }
+    }
+
+    private fun persistBeforePlaylistJump(context: Context?) {
+        val appContext = context ?: return
+        if (!PreferenceManager.getDefaultSharedPreferences(appContext)
+                .getBoolean("save_position", false))
+            return
+
+        // Avoid recreating a resume point for a file that has completed but whose old path is
+        // still briefly readable while mpv is entering idle or advancing the playlist.
+        if (MPVLib.getPropertyBoolean("eof-reached") == true ||
+            MPVLib.getPropertyBoolean("idle-active") == true)
+            return
+        if (MPVLib.getPropertyString("path") != null)
+            MPVLib.command(arrayOf("write-watch-later-config"))
     }
 
     companion object {

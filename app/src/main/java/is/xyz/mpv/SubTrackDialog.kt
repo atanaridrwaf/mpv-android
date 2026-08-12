@@ -21,6 +21,12 @@ internal class SubTrackDialog(private val player: MPVView) {
     // ID of the selected secondary track
     private var selectedMpvId2 = -1
 
+    // When the user selects a track while the dialog is open, mpv may take a short moment
+    // to reflect the new value in its properties. Keep an optimistic "pending" selection so
+    // the UI updates immediately without requiring the dialog to be reopened.
+    private var pendingMpvId: Int? = null
+    private var pendingMpvId2: Int? = null
+
     var listener: Listener? = null
 
     fun buildView(layoutInflater: LayoutInflater): View {
@@ -45,16 +51,35 @@ internal class SubTrackDialog(private val player: MPVView) {
 
     fun refresh() {
         tracks = player.tracks.getValue(TRACK_TYPE)
-        selectedMpvId = player.sid
-        selectedMpvId2 = player.secondarySid
+
+        val sidNow = player.sid
+        val sid2Now = player.secondarySid
+
+        // Prefer pending values (set by clicks) until mpv reflects them, then clear.
+        selectedMpvId = pendingMpvId?.let {
+            if (sidNow == it) {
+                pendingMpvId = null
+                sidNow
+            } else it
+        } ?: sidNow
+
+        selectedMpvId2 = pendingMpvId2?.let {
+            if (sid2Now == it) {
+                pendingMpvId2 = null
+                sid2Now
+            } else it
+        } ?: sid2Now
 
         // this is what you get for not using a proper tab view...
         val darkenDrawable = ContextCompat.getDrawable(binding.root.context, R.drawable.alpha_darken)
         binding.primaryBtn.background = if (secondary) null else darkenDrawable
         binding.secondaryBtn.background = if (secondary) darkenDrawable else null
 
-        // show primary/secondary toggle if applicable
-        if (secondary || selectedMpvId2 != -1 || tracks.size > 2) {
+        // Show primary/secondary toggle when there is at least one real subtitle track.
+        // `tracks` always contains a pseudo "Off" track (mpvId == -1).
+        // - size == 1 -> only "Off" (no subtitles)
+        // - size >= 2 -> at least one real subtitle track
+        if (secondary || selectedMpvId2 != -1 || tracks.size > 1) {
             binding.buttonRow.visibility = View.VISIBLE
             binding.divider.visibility = View.VISIBLE
         } else {
@@ -64,7 +89,9 @@ internal class SubTrackDialog(private val player: MPVView) {
 
         binding.list.adapter!!.notifyDataSetChanged()
         val index = tracks.indexOfFirst { it.mpvId == if (secondary) selectedMpvId2 else selectedMpvId }
-        binding.list.scrollToPosition(index)
+        if (index >= 0) {
+            binding.list.scrollToPosition(index)
+        }
 
         // should fix a layout bug with empty space that happens on api 33
         binding.list.post {
@@ -73,7 +100,22 @@ internal class SubTrackDialog(private val player: MPVView) {
     }
 
     private fun clickItem(position: Int) {
-        val item = tracks[position]
+        if (position == RecyclerView.NO_POSITION) return
+        val item = tracks.getOrNull(position) ?: return
+
+        // Update local selection immediately so the radio/check circle changes instantly.
+        if (secondary) {
+            pendingMpvId2 = item.mpvId
+            selectedMpvId2 = item.mpvId
+        } else {
+            pendingMpvId = item.mpvId
+            selectedMpvId = item.mpvId
+        }
+
+        // Re-bind visible rows with the new selection state.
+        // (Do NOT rely on player.sid/secondarySid here; mpv updates those asynchronously.)
+        binding.list.adapter?.notifyDataSetChanged()
+
         listener?.invoke(item, secondary)
     }
 
