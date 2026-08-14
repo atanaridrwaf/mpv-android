@@ -338,7 +338,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var shouldSavePosition = false
     private var currentWatchLaterPath: String? = null
     private var completedWatchLaterPath: String? = null
-    private var trackRestorePathForPreload: String? = null
 
     private var autoRotationMode = ""
 
@@ -2111,86 +2110,64 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    /**
-     * Attach saved external tracks during mpv's on_load hook. Unlike audio-add/sub-add from
-     * FILE_LOADED, these file-local list options are part of the original open operation, so the
-     * embedded defaults never need to be decoded, heard or rendered first.
-     */
-    private fun prepareSavedExternalTracksForLoad(mediaPath: String) {
+    private fun restoreSubtitleSelectionForCurrentFile() {
+        if (!fileStatePersistenceEnabled())
+            return
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
         val prefs = getDefaultSharedPreferences(applicationContext)
 
-        if (prefs.getString(perFileKey(PREF_AUD_KIND, mediaPath), null) ==
-            PREF_AUD_KIND_EXTERNAL
-        ) {
-            prefs.getString(perFileKey(PREF_AUD_EXTERNAL, mediaPath), null)
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { player.appendFileLocalListItem("audio-files", it) }
+        fun setSubProp(prop: String, id: Int) {
+            player.setFileLocalTrack(prop, id)
         }
 
-        // A path used in both subtitle slots must only be appended once. The assigned track ID is
-        // resolved independently for each slot in on_preloaded.
-        val externalSubtitles = linkedSetOf<String>()
-        fun collectSubtitle(kindKey: String, externalKey: String) {
-            if (prefs.getString(perFileKey(kindKey, mediaPath), null) !=
-                PREF_SUB_KIND_EXTERNAL
-            ) {
-                return
-            }
-            prefs.getString(perFileKey(externalKey, mediaPath), null)
-                ?.takeIf { it.isNotEmpty() }
-                ?.let(externalSubtitles::add)
-        }
-        collectSubtitle(PREF_SUB_KIND, PREF_SUB_EXTERNAL)
-        collectSubtitle(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL)
-        for (subtitle in externalSubtitles)
-            player.appendFileLocalListItem("sub-files", subtitle)
-    }
-
-    /**
-     * Select saved tracks during mpv's on_preloaded hook. At this point external files already
-     * have IDs, while default track selection and decoder/audio-output creation have not happened.
-     */
-    private fun restoreSavedTrackSelectionsBeforePlayback(mediaPath: String) {
-        val prefs = getDefaultSharedPreferences(applicationContext)
-
-        fun resolveSelection(
-            kindKey: String,
-            externalKey: String,
-            idKey: String,
-            trackType: String,
-        ): Int? {
-            val kind = prefs.getString(perFileKey(kindKey, mediaPath), null)
-            if (kind == PREF_SUB_KIND_EXTERNAL || kind == PREF_AUD_KIND_EXTERNAL) {
-                val external = prefs.getString(perFileKey(externalKey, mediaPath), null)
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: return null
-                return findExternalTrackIdForFilename(trackType, external).also { id ->
-                    if (id == null)
-                        Log.w(TAG, "saved external $trackType track unavailable before playback: $external")
+        fun resolveSelection(kind: String?, external: String?, sid: Int?): Int? {
+            return when (kind) {
+                PREF_SUB_KIND_EXTERNAL -> {
+                    if (external.isNullOrEmpty()) {
+                        null
+                    } else {
+                        var id = findExternalSubSidForFilename(external)
+                        if (id == null) {
+                            // `auto` loads the track without making it primary. Resolve both
+                            // tracks first, then assign primary and secondary deterministically.
+                            MPVLib.command(arrayOf("sub-add", external, "auto"))
+                            id = waitForExternalSubSid(external)
+                        }
+                        id
+                    }
                 }
+                PREF_SUB_KIND_SID -> sid
+                else -> null
             }
-            if (kind == PREF_SUB_KIND_SID || kind == PREF_AUD_KIND_SID) {
-                val key = perFileKey(idKey, mediaPath)
-                return if (prefs.contains(key)) prefs.getInt(key, -1) else null
-            }
-            return null
         }
 
-        val aid = resolveSelection(PREF_AUD_KIND, PREF_AUD_EXTERNAL, PREF_AUD_SID, "audio")
-        val primarySid = resolveSelection(PREF_SUB_KIND, PREF_SUB_EXTERNAL, PREF_SUB_SID, "sub")
-        val secondarySid =
-            resolveSelection(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL, PREF_SUB2_SID, "sub")
+        val kind1 = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null)
+        val ext1 = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
+        val sid1 = if (prefs.contains(perFileKey(PREF_SUB_SID, mediaPath)))
+            prefs.getInt(perFileKey(PREF_SUB_SID, mediaPath), -1)
+        else
+            null
 
-        aid?.let { player.setFileLocalTrack("aid", it) }
-        primarySid?.let { player.setFileLocalTrack("sid", it) }
-        secondarySid?.let { player.setFileLocalTrack("secondary-sid", it) }
+        val kind2 = prefs.getString(perFileKey(PREF_SUB2_KIND, mediaPath), null)
+        val ext2 = prefs.getString(perFileKey(PREF_SUB2_EXTERNAL, mediaPath), null)
+        val sid2 = if (prefs.contains(perFileKey(PREF_SUB2_SID, mediaPath)))
+            prefs.getInt(perFileKey(PREF_SUB2_SID, mediaPath), -1)
+        else
+            null
+
+        // Adding an external track can influence mpv's automatic primary selection. Resolve every
+        // stored file first, then set the two slots explicitly so their order cannot be swapped.
+        val resolvedPrimary = resolveSelection(kind1, ext1, sid1)
+        val resolvedSecondary = resolveSelection(kind2, ext2, sid2)
+        resolvedPrimary?.let { setSubProp("sid", it) }
+        resolvedSecondary?.let { setSubProp("secondary-sid", it) }
     }
 
-    private fun findExternalTrackIdForFilename(trackType: String, filename: String): Int? {
+    private fun findExternalSubSidForFilename(filename: String): Int? {
         val count = MPVLib.getPropertyInt("track-list/count") ?: return null
         for (i in 0 until count) {
             val type = MPVLib.getPropertyString("track-list/$i/type") ?: continue
-            if (type != trackType) continue
+            if (type != "sub") continue
             val isExternal = MPVLib.getPropertyBoolean("track-list/$i/external") == true
             if (!isExternal) continue
             val fn = MPVLib.getPropertyString("track-list/$i/external-filename") ?: continue
@@ -2198,6 +2175,21 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return MPVLib.getPropertyInt("track-list/$i/id")
         }
         return null
+    }
+
+    private fun waitForExternalSubSid(filename: String, timeoutMs: Long = 350L): Int? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            val sid = findExternalSubSidForFilename(filename)
+            if (sid != null) return sid
+            try {
+                Thread.sleep(10)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        // One last attempt.
+        return findExternalSubSidForFilename(filename)
     }
 
     private fun findExternalSubFilenameForSid(sid: Int): String? {
@@ -2250,6 +2242,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             putString(perFileKey(PREF_AUD_EXTERNAL, mediaPath), audioPath)
             remove(perFileKey(PREF_AUD_SID, mediaPath))
             commit()
+        }
+    }
+
+    private fun restoreAudioSelectionForCurrentFile() {
+        if (!fileStatePersistenceEnabled())
+            return
+        val mediaPath = MPVLib.getPropertyString("path") ?: return
+        val prefs = getDefaultSharedPreferences(applicationContext)
+
+        val kind = prefs.getString(perFileKey(PREF_AUD_KIND, mediaPath), null) ?: return
+        val ext = prefs.getString(perFileKey(PREF_AUD_EXTERNAL, mediaPath), null)
+        val hasAid = prefs.contains(perFileKey(PREF_AUD_SID, mediaPath))
+        val aid = if (hasAid) prefs.getInt(perFileKey(PREF_AUD_SID, mediaPath), -1) else null
+
+        when (kind) {
+            PREF_AUD_KIND_EXTERNAL -> {
+                if (!ext.isNullOrEmpty()) {
+                    // "cached" → يضيف الملف ويختاره، ولو كان موجوداً مسبقاً يُعاد استخدامه
+                    MPVLib.command(arrayOf("audio-add", ext, "cached"))
+                }
+            }
+            PREF_AUD_KIND_SID -> {
+                if (aid != null) {
+                    player.setFileLocalTrack("aid", aid)
+                }
+            }
         }
     }
 
@@ -3826,32 +3844,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         eventUiHandler.post { handleScrubCommandReply(userdata, error) }
     }
 
-    override fun eventHook(name: String) {
-        when (name) {
-            "on_load" -> {
-                trackRestorePathForPreload = null
-                if (!fileStatePersistenceEnabled())
-                    return
-
-                // `path` is the persistence identity used after FILE_LOADED. The stream property
-                // is the documented on_load fallback for unusual protocols and redirected media.
-                val mediaPath = MPVLib.getPropertyString("path")
-                    ?: MPVLib.getPropertyString("stream-open-filename")
-                    ?: return
-                trackRestorePathForPreload = mediaPath
-                prepareSavedExternalTracksForLoad(mediaPath)
-            }
-            "on_preloaded" -> {
-                val mediaPath = trackRestorePathForPreload
-                    ?: MPVLib.getPropertyString("path")
-                    ?: MPVLib.getPropertyString("stream-open-filename")
-                trackRestorePathForPreload = null
-                if (mediaPath != null && fileStatePersistenceEnabled())
-                    restoreSavedTrackSelectionsBeforePlayback(mediaPath)
-            }
-        }
-    }
-
     override fun event(eventId: Int) {
         if (eventId == MpvEvent.MPV_EVENT_END_FILE) {
             psc.eof()
@@ -3880,6 +3872,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             player.configureFileStatePersistence(persistFileState)
 
             if (persistFileState) {
+                // Restore the chosen audio before any subtitle loading or synchronous preference
+                // writes. Resolving two external subtitles can take a few hundred milliseconds;
+                // doing that first lets mpv briefly start the embedded audio before audio-add
+                // selects the saved external track.
+                try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
+
                 // These app snapshots survive deletion of watch-later at natural EOF, so only
                 // `start` is reset while gamma, delays and the other controls are restored.
                 try { player.restoreCurrentFilePlaybackOptions() } catch (_: Throwable) {}
@@ -3887,8 +3885,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // migrates existing installs before that file is removed at natural EOF.
                 try { player.persistCurrentPlaybackOptions() } catch (_: Throwable) {}
 
-                // Audio and subtitle files/IDs were already restored synchronously by on_load and
-                // on_preloaded, before mpv selected tracks or created any decoders.
+                // Track IDs and the external track list are authoritative only after FILE_LOADED.
+                // Restore both subtitle slots now so a previous file or mpv's automatic selection
+                // cannot swap primary and secondary while the new file is still being initialized.
+                try { restoreSubtitleSelectionForCurrentFile() } catch (_: Throwable) {}
                 try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
             } else {
                 // resume-playback was disabled before loading, so this removes any old state
@@ -3916,7 +3916,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             currentWatchLaterPath = null
             completedWatchLaterPath = null
-            trackRestorePathForPreload = null
 
             eventUiHandler.postAtFrontOfQueue {
                 mediaGeometryReadyForOrientation = false
