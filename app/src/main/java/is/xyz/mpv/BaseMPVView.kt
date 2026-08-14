@@ -68,16 +68,19 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     protected abstract fun observeProperties()
 
     private var filePath: String? = null
+    private var fileOptions: Map<String, String> = emptyMap()
 
     /**
      * Set the first file to be played once the player is ready.
      */
-    fun playFile(filePath: String) {
+    fun playFile(filePath: String, options: Map<String, String> = emptyMap()) {
         if (attachedSurface != null) {
-            MPVLib.command(arrayOf("loadfile", filePath))
+            MPVLib.loadFile(filePath, options = options)
             this.filePath = null
+            this.fileOptions = emptyMap()
         } else {
             this.filePath = filePath
+            this.fileOptions = options.toMap()
         }
     }
 
@@ -170,8 +173,9 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         MPVLib.setOptionString("force-window", "yes")
 
         if (filePath != null) {
-            MPVLib.command(arrayOf("loadfile", filePath as String))
+            MPVLib.loadFile(filePath as String, options = fileOptions)
             filePath = null
+            fileOptions = emptyMap()
         } else {
             // We disable video output when the context disappears, enable it back
             MPVLib.setPropertyString("vo", voInUse)
