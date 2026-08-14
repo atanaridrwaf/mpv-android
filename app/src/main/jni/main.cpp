@@ -78,6 +78,14 @@ jni_func(void, init) {
     if (mpv_initialize(g_mpv) < 0)
         die("mpv init failed");
 
+    // These hooks form a synchronous part of mpv's normal file-loading pipeline. Java uses
+    // on_load to attach saved external files before the main demuxer is opened, then uses
+    // on_preloaded to select their assigned track IDs before decoders and audio output exist.
+    if (mpv_hook_add(g_mpv, 0, "on_load", 0) < 0)
+        die("failed to register on_load hook");
+    if (mpv_hook_add(g_mpv, 0, "on_preloaded", 0) < 0)
+        die("failed to register on_preloaded hook");
+
     g_event_thread_request_exit = false;
     if (pthread_create(&event_thread_id, NULL, event_thread, NULL) != 0)
         die("thread create failed");
@@ -149,4 +157,3 @@ jni_func(void, abortAsyncCommand, jlong userdata) {
     CHECK_MPV_INIT();
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
-
