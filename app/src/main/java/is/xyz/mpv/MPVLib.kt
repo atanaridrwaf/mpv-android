@@ -25,36 +25,6 @@ object MPVLib {
     external fun commandAsync(cmd: Array<out String>, userdata: Long): Int
     external fun abortAsyncCommand(userdata: Long)
 
-    private external fun commandLoadFile(
-        filePath: String,
-        flags: String,
-        optionNames: Array<out String>,
-        optionValues: Array<out String>,
-    ): Int
-
-    /**
-     * Add a playlist entry with native per-file options. A node map is used instead of mpv's
-     * comma-separated string form so arbitrary filenames cannot be mistaken for separators.
-     */
-    fun loadFile(
-        filePath: String,
-        flags: String = "replace",
-        options: Map<String, String> = emptyMap(),
-    ) {
-        if (options.isEmpty()) {
-            command(arrayOf("loadfile", filePath, flags))
-            return
-        }
-
-        val entries = options.entries.toList()
-        commandLoadFile(
-            filePath,
-            flags,
-            entries.map { it.key }.toTypedArray(),
-            entries.map { it.value }.toTypedArray(),
-        )
-    }
-
     external fun setOptionString(name: String, value: String): Int
 
     external fun grabThumbnail(dimension: Int): Bitmap?
