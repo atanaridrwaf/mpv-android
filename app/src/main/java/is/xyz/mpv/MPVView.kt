@@ -154,10 +154,14 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             }
 
             // Saving is all-or-nothing for this app: position and every app-controlled per-file
-            // option are stored together while the preference is enabled.
+            // option are stored together while the preference is enabled. Track IDs are kept
+            // out of watch-later because MPVActivity persists them together with external
+            // filenames; restoring an external ID before its file is added leaves mpv with a
+            // stale option value and an embedded track selected.
             mergeStringListProperty(
                 "watch-later-options",
-                PER_FILE_PLAYBACK_OPTIONS + "start"
+                WATCH_LATER_PLAYBACK_OPTIONS + "start",
+                remove = APP_MANAGED_TRACK_OPTIONS
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -208,6 +212,26 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     fun setFileLocalDouble(name: String, value: Double) {
         MPVLib.setPropertyDouble("file-local-options/$name", value)
+    }
+
+    /**
+     * Select a track for the current file even if watch-later left its unavailable ID in the
+     * underlying option. In that state mpv reports the effective embedded track, but assigning the
+     * same stale option again is a no-op. Synchronize the file-local option with the effective
+     * selection first so a subsequently added external track can be selected in one tap.
+     */
+    fun setFileLocalTrack(name: String, value: Int) {
+        require(name in TRACK_SELECTION_OPTIONS)
+
+        val target = if (value == -1) "no" else value.toString()
+        val effective = MPVLib.getPropertyString(name)
+        if (effective != target)
+            setFileLocalString(name, effective ?: "no")
+
+        if (value == -1)
+            setFileLocalString(name, "no")
+        else
+            setFileLocalInt(name, value)
     }
 
     fun persistCurrentFileState() {
@@ -567,10 +591,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             return v?.toIntOrNull() ?: -1
         }
         operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) {
-            if (value == -1)
-                setFileLocalString(name, "no")
-            else
-                setFileLocalInt(name, value)
+            setFileLocalTrack(name, value)
         }
     }
 
@@ -649,8 +670,13 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     companion object {
         private const val TAG = "mpv"
 
-        // Options controlled per media item by the Android UI. These are both reset between
-        // playlist entries and included in watch-later persistence.
+        // MPVActivity stores these IDs separately so external filenames can be restored before
+        // selecting the corresponding dynamically assigned track ID.
+        private val APP_MANAGED_TRACK_OPTIONS = setOf("aid", "sid", "secondary-sid")
+        private val TRACK_SELECTION_OPTIONS = APP_MANAGED_TRACK_OPTIONS + "vid"
+
+        // Options controlled per media item by the Android UI. All are reset between playlist
+        // entries; the app-managed audio/subtitle IDs are excluded from watch-later below.
         private val PER_FILE_PLAYBACK_OPTIONS = linkedSetOf(
             "speed",
             "audio-delay",
@@ -669,9 +695,12 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             "vid",
         )
 
+        private val WATCH_LATER_PLAYBACK_OPTIONS =
+            PER_FILE_PLAYBACK_OPTIONS - APP_MANAGED_TRACK_OPTIONS
+
         // Audio/subtitle IDs are restored together with external filenames by MPVActivity.
         private val APP_PERSISTED_PLAYBACK_OPTIONS =
-            PER_FILE_PLAYBACK_OPTIONS - setOf("aid", "sid", "secondary-sid")
+            PER_FILE_PLAYBACK_OPTIONS - APP_MANAGED_TRACK_OPTIONS
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"

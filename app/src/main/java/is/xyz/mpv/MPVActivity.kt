@@ -2117,10 +2117,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val prefs = getDefaultSharedPreferences(applicationContext)
 
         fun setSubProp(prop: String, id: Int) {
-            if (id == -1)
-                player.setFileLocalString(prop, "no")
-            else
-                player.setFileLocalInt(prop, id)
+            player.setFileLocalTrack(prop, id)
         }
 
         fun resolveSelection(kind: String?, external: String?, sid: Int?): Int? {
@@ -2268,8 +2265,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
             PREF_AUD_KIND_SID -> {
                 if (aid != null) {
-                    if (aid == -1) player.setFileLocalString("aid", "no")
-                    else player.setFileLocalInt("aid", aid)
+                    player.setFileLocalTrack("aid", aid)
                 }
             }
         }
