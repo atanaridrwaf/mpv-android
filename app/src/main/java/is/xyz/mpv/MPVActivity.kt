@@ -119,7 +119,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val commandValueSec: Double,
         val directionalKeyframeDirection: Int,
         val issuedAtMs: Long,
-        val frameFloor: Long
+        val frameFloor: Long,
+        val exactResume: Boolean
     ) {
         var superseded = false
         var commandReplyReceived = false
@@ -143,6 +144,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // Keeping it separate from mpv's real "pause" property makes play/pause controls symmetric:
     // the user can change their mind while a slow exact seek is still completing.
     private var scrubPlaybackPaused: Boolean? = null
+
+    // MediaCodec/AudioTrack can retain queued timing across a plain pause toggle. Remember the
+    // frame confirmed by mpv after pausing, then seek back to that exact PTS before unpausing so
+    // playback cannot restart from a later queued frame.
+    @Volatile
+    private var exactPauseCaptureGeneration = 0L
+    private var exactPauseCaptureCounter = 0L
+    private var exactPausedFrameSec: Double? = null
+    private var exactResumeWaitingForCaptureGeneration: Long? = null
 
     private val scrubFrameGraceRunnable = Runnable { finishScrubSeekAfterFrameGrace() }
     private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
@@ -1681,6 +1691,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             '#' -> cycleAudio()
             '<' -> playlistPrev()
             '>' -> playlistNext()
+            ' ' -> if (event.repeatCount == 0) togglePlaybackPauseFromUi()
 
             else -> unhandled++
         }
@@ -1694,13 +1705,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK -> cycleAudio()
             KeyEvent.KEYCODE_MEDIA_PREVIOUS -> playlistPrev()
             KeyEvent.KEYCODE_MEDIA_NEXT -> playlistNext()
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ->
+                if (event.repeatCount == 0) togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_MEDIA_PLAY -> setPlaybackPausedFromUi(false)
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> setPlaybackPausedFromUi(true)
             KeyEvent.KEYCODE_INFO -> toggleControls()
             KeyEvent.KEYCODE_MENU -> openTopMenu()
             KeyEvent.KEYCODE_GUIDE -> openTopMenu()
-            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> player.cyclePause()
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> togglePlaybackPauseFromUi()
 
             // (overrides a default binding)
-            KeyEvent.KEYCODE_ENTER -> player.cyclePause()
+            KeyEvent.KEYCODE_ENTER -> togglePlaybackPauseFromUi()
 
             else -> unhandled++
         }
@@ -3681,10 +3696,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPause() {
-            player.paused = true
+            setPlaybackPausedFromUi(true)
         }
         override fun onPlay() {
-            player.paused = false
+            setPlaybackPausedFromUi(false)
         }
         override fun onSeekTo(pos: Long) {
             player.timePos = (pos / 1000.0)
@@ -3820,6 +3835,17 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Boolean) {
+        // Capture only after mpv confirms pause. Reading playback-time on the event thread also
+        // avoids blocking Android's main thread on mpv's core lock during hardware decoding.
+        val pauseCaptureGeneration = if (property == "pause" && value)
+            exactPauseCaptureGeneration
+        else
+            0L
+        val pausedFrameSec = if (property == "pause" && value)
+            readScrubPlaybackTimeFromMpv()
+        else
+            null
+
         if (property == "seeking") {
             // Property callbacks arrive on mpv's event thread. Read the final high-resolution
             // position there so the Android main thread never blocks on mpv_get_property.
@@ -3859,6 +3885,23 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (metaUpdated || property == "mute")
             handleAudioFocus()
+
+        if (property == "pause") {
+            eventUiHandler.post {
+                if (value) {
+                    if (pauseCaptureGeneration != 0L) {
+                        completeExactPauseFrameCapture(pauseCaptureGeneration, pausedFrameSec)
+                    } else if (scrubPlaybackPaused == null && psc.pause) {
+                        // Also remember pauses initiated by another foreground control. If the
+                        // in-app play control resumes them, it still gets exact-frame behavior.
+                        exactPausedFrameSec = validPlaybackTime(pausedFrameSec)
+                            ?: cachedPlaybackTimeSec()
+                    }
+                } else if (scrubPlaybackPaused == null && exactPauseCaptureGeneration == 0L) {
+                    clearExactPauseResumeState()
+                }
+            }
+        }
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value) }
@@ -4056,6 +4099,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         activeScrubSeek = null
         scrubSeekInFlight = false
         scrubPlaybackPaused = null
+        clearExactPauseResumeState()
         if (desiredPlaybackPaused != null) {
             player.paused = desiredPlaybackPaused
             updatePlaybackStatus(desiredPlaybackPaused)
@@ -4090,6 +4134,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         val playbackPaused = scrubPlaybackPaused ?: return
         scrubPlaybackPaused = null
+        if (playbackPaused) {
+            exactPausedFrameSec = validPlaybackTime(latestPlaybackTimeSec)
+                ?: exactPausedFrameSec
+                ?: cachedPlaybackTimeSec()
+        } else {
+            clearExactPauseResumeState()
+        }
         player.paused = playbackPaused
         // Setting the same mpv value does not necessarily emit a property event.
         updatePlaybackStatus(playbackPaused)
@@ -4097,18 +4148,116 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private fun togglePlaybackPauseFromUi() {
         val playbackPaused = scrubPlaybackPaused
-        if (playbackPaused == null) {
-            player.cyclePause()
+            ?: if (exactPauseCaptureGeneration != 0L) true else psc.pause
+        setPlaybackPausedFromUi(!playbackPaused)
+    }
+
+    private fun setPlaybackPausedFromUi(paused: Boolean) {
+        val heldPlaybackPaused = scrubPlaybackPaused
+        if (heldPlaybackPaused != null) {
+            if (heldPlaybackPaused == paused)
+                return
+
+            // Record the user's desired post-seek state, but keep mpv physically paused until the
+            // newest exact seek has produced its frame. Decoding while playback runs makes heavy
+            // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
+            scrubPlaybackPaused = paused
+            player.paused = true
+            updatePlaybackStatus(paused)
             return
         }
 
-        // Record the user's desired post-seek state, but keep mpv physically paused until the
-        // newest exact seek has produced its frame. Decoding while playback runs makes heavy
-        // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
-        val newPlaybackPaused = !playbackPaused
-        scrubPlaybackPaused = newPlaybackPaused
+        // The observed property is deliberately used instead of mpv_get_property on Android's
+        // main thread. A pending capture already represents a pause request whose callback has
+        // not reached the cache yet.
+        val playerPaused = if (exactPauseCaptureGeneration != 0L) true else psc.pause
+        if (playerPaused == paused) {
+            updatePlaybackStatus(paused)
+            return
+        }
+
+        if (paused)
+            pausePlaybackAtExactFrame()
+        else
+            resumePlaybackFromExactFrame()
+    }
+
+    private fun pausePlaybackAtExactFrame() {
+        val generation = ++exactPauseCaptureCounter
+        exactPausedFrameSec = null
+        exactResumeWaitingForCaptureGeneration = null
+        exactPauseCaptureGeneration = generation
+
         player.paused = true
-        updatePlaybackStatus(newPlaybackPaused)
+        updatePlaybackStatus(true)
+
+        // A normal pause change produces a property callback immediately. This guarded fallback
+        // covers a redundant/vendor-delayed callback without ever reading mpv on the UI thread.
+        eventUiHandler.postDelayed(
+            { completeExactPauseFrameCapture(generation, null) },
+            EXACT_PAUSE_CAPTURE_FALLBACK_MS
+        )
+    }
+
+    private fun resumePlaybackFromExactFrame() {
+        scrubPlaybackPaused = false
+        player.paused = true
+        updatePlaybackStatus(false)
+
+        val captureGeneration = exactPauseCaptureGeneration
+        if (captureGeneration != 0L) {
+            exactResumeWaitingForCaptureGeneration = captureGeneration
+            return
+        }
+
+        startExactResumeSeek()
+    }
+
+    private fun completeExactPauseFrameCapture(generation: Long, playbackTimeSec: Double?) {
+        if (generation == 0L || exactPauseCaptureGeneration != generation)
+            return
+
+        exactPauseCaptureGeneration = 0L
+        exactPausedFrameSec = validPlaybackTime(playbackTimeSec) ?: cachedPlaybackTimeSec()
+
+        if (exactResumeWaitingForCaptureGeneration != generation)
+            return
+
+        exactResumeWaitingForCaptureGeneration = null
+        if (scrubPlaybackPaused == false)
+            startExactResumeSeek()
+        else
+            finishScrubPlaybackHoldIfReady()
+    }
+
+    private fun startExactResumeSeek() {
+        val targetSec = exactPausedFrameSec
+        val hasVideo = try { player.vid != -1 } catch (_: Throwable) { false }
+        if (!hasVideo || targetSec == null) {
+            finishScrubPlaybackHoldIfReady()
+            return
+        }
+
+        Log.v(TAG, "restoring paused frame before resume @ $targetSec")
+        queueScrubSeek(
+            targetSec = targetSec,
+            exact = true,
+            commandValueSec = targetSec,
+            commandMode = "absolute+exact",
+            exactResume = true
+        )
+    }
+
+    private fun validPlaybackTime(value: Double?): Double? =
+        value?.takeIf { it.isFinite() && it >= 0.0 }
+
+    private fun cachedPlaybackTimeSec(): Double? =
+        psc.position.takeIf { it >= 0L }?.div(1000.0)
+
+    private fun clearExactPauseResumeState() {
+        exactPauseCaptureGeneration = 0L
+        exactResumeWaitingForCaptureGeneration = null
+        exactPausedFrameSec = null
     }
 
     private fun invalidateGestureStableTargetCheck() {
@@ -4236,7 +4385,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         exact: Boolean,
         commandValueSec: Double,
         commandMode: String,
-        directionalKeyframeDirection: Int = 0
+        directionalKeyframeDirection: Int = 0,
+        exactResume: Boolean = false
     ): Boolean {
         supersedeActiveScrubSeekIfTargetChanged(targetSec, exact)
 
@@ -4248,7 +4398,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             commandValueSec = commandValueSec,
             directionalKeyframeDirection = directionalKeyframeDirection,
             issuedAtMs = SystemClock.uptimeMillis(),
-            frameFloor = playerSurfaceFrameSerial
+            frameFloor = playerSurfaceFrameSerial,
+            exactResume = exactResume
         )
 
         // Install the request before entering JNI. A very fast COMMAND_REPLY is posted back to the
@@ -4334,9 +4485,17 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         latestPlaybackTimeSec = value
         if (request.exact) {
             val distance = abs(value - request.targetSec)
-            if (distance <= SCRUB_TARGET_NEAR_TOLERANCE_SEC)
+            val reachedTolerance = if (request.exactResume)
+                EXACT_RESUME_TARGET_REACHED_TOLERANCE_SEC
+            else
+                SCRUB_TARGET_REACHED_TOLERANCE_SEC
+            val nearTolerance = if (request.exactResume)
+                reachedTolerance
+            else
+                SCRUB_TARGET_NEAR_TOLERANCE_SEC
+            if (distance <= nearTolerance)
                 request.targetPositionNear = true
-            if (distance <= SCRUB_TARGET_REACHED_TOLERANCE_SEC)
+            if (distance <= reachedTolerance)
                 request.targetPositionSeen = true
         }
     }
@@ -4436,9 +4595,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (request.exact && !request.superseded && reason != "timeout") {
             val elapsed = (SystemClock.uptimeMillis() - request.issuedAtMs).coerceAtLeast(1L)
+            val operation = if (request.exactResume) "exact resume seek" else "exact scrub seek"
             Log.v(
                 TAG,
-                "exact scrub seek generation ${request.generation} completed by $reason in ${elapsed}ms"
+                "$operation generation ${request.generation} completed by $reason in ${elapsed}ms"
             )
         }
 
@@ -4739,6 +4899,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val SCRUB_TARGET_COMPARE_EPSILON_SEC = 0.0005
         private const val SCRUB_TARGET_REACHED_TOLERANCE_SEC = 0.075
         private const val SCRUB_TARGET_NEAR_TOLERANCE_SEC = 0.75
+        // The captured value is the full-precision PTS of the displayed paused frame. Keep the
+        // resume tolerance well below a normal frame interval so an adjacent frame cannot pass.
+        private const val EXACT_RESUME_TARGET_REACHED_TOLERANCE_SEC = 0.002
+        private const val EXACT_PAUSE_CAPTURE_FALLBACK_MS = 100L
         private const val SCRUB_FRAME_GRACE_MS = 350L
         private const val SCRUB_SEEK_HARD_TIMEOUT_MS = 45_000L
         private const val KEYFRAME_DIRECTION_EPSILON_SEC = 0.001
