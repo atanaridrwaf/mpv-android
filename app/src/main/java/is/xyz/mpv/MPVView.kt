@@ -286,6 +286,30 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
+    /**
+     * Import options that may exist only in an older watch-later file. Existing app snapshots
+     * remain authoritative, and apply() keeps its disk write off mpv's event thread.
+     */
+    fun migrateMissingCurrentPlaybackOptions() {
+        if (!fileStatePersistenceEnabled())
+            return
+        val path = MPVLib.getPropertyString("path") ?: return
+        val preferences = PreferenceManager.getDefaultSharedPreferences(context)
+        val editor = preferences.edit()
+        var changed = false
+
+        for (option in APP_PERSISTED_PLAYBACK_OPTIONS) {
+            val key = perFilePlaybackOptionKey(path, option)
+            if (preferences.contains(key))
+                continue
+            val value = MPVLib.getPropertyString(option) ?: continue
+            editor.putString(key, value)
+            changed = true
+        }
+        if (changed)
+            editor.apply()
+    }
+
     fun restoreCurrentFilePlaybackOptions() {
         if (!fileStatePersistenceEnabled())
             return
