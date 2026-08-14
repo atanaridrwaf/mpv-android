@@ -206,6 +206,14 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setPropertyString("file-local-options/$name", value)
     }
 
+    /**
+     * Append one unescaped item to a file-local mpv list option. This is used from the on_load
+     * hook, where mpv explicitly allows file-local options to be prepared before opening media.
+     */
+    fun appendFileLocalListItem(name: String, value: String) {
+        MPVLib.setPropertyString("file-local-options/${name}-append", value)
+    }
+
     fun setFileLocalInt(name: String, value: Int) {
         MPVLib.setPropertyInt("file-local-options/$name", value)
     }

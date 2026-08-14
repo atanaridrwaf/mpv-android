@@ -112,6 +112,18 @@ object MPVLib {
         }
     }
 
+    /**
+     * Dispatch a synchronous libmpv hook. The native event loop continues the hook immediately
+     * after this callback returns, so observers must finish all hook-related property writes here.
+     */
+    @JvmStatic
+    fun eventHook(name: String) {
+        synchronized(observers) {
+            for (o in observers)
+                o.eventHook(name)
+        }
+    }
+
     @JvmStatic
     fun eventEndFile(reachedEof: Boolean) {
         synchronized(observers) {
@@ -151,6 +163,7 @@ object MPVLib {
         fun eventProperty(property: String, value: String)
         fun eventProperty(property: String, value: Double)
         fun eventCommandReply(userdata: Long, error: Int) {}
+        fun eventHook(name: String) {}
         fun event(eventId: Int)
         fun eventEndFile(reachedEof: Boolean) {
             event(MpvEvent.MPV_EVENT_END_FILE)
