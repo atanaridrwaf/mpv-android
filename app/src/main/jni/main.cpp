@@ -28,8 +28,6 @@ extern "C" {
     jni_func(void, command, jobjectArray jarray);
     jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata);
     jni_func(void, abortAsyncCommand, jlong userdata);
-    jni_func(jint, commandLoadFile, jstring path, jstring flags,
-             jobjectArray option_names, jobjectArray option_values);
 };
 
 JavaVM *g_vm;
@@ -123,79 +121,6 @@ jni_func(void, command, jobjectArray jarray) {
     }
 }
 
-jni_func(jint, commandLoadFile, jstring jpath, jstring jflags,
-         jobjectArray joption_names, jobjectArray joption_values) {
-    CHECK_MPV_INIT();
-
-    constexpr int MAX_OPTIONS = 64;
-    const jsize option_count = env->GetArrayLength(joption_names);
-    if (option_count != env->GetArrayLength(joption_values) ||
-        option_count > MAX_OPTIONS) {
-        ALOGE("invalid loadfile option arrays");
-        return MPV_ERROR_INVALID_PARAMETER;
-    }
-
-    const char *path = env->GetStringUTFChars(jpath, NULL);
-    const char *flags = env->GetStringUTFChars(jflags, NULL);
-
-    jstring option_names[MAX_OPTIONS] = {0};
-    jstring option_values[MAX_OPTIONS] = {0};
-    char *option_keys[MAX_OPTIONS] = {0};
-    mpv_node option_nodes[MAX_OPTIONS] = {};
-
-    for (jsize i = 0; i < option_count; ++i) {
-        option_names[i] = (jstring)env->GetObjectArrayElement(joption_names, i);
-        option_values[i] = (jstring)env->GetObjectArrayElement(joption_values, i);
-        option_keys[i] = const_cast<char *>(
-            env->GetStringUTFChars(option_names[i], NULL));
-        option_nodes[i].format = MPV_FORMAT_STRING;
-        option_nodes[i].u.string = const_cast<char *>(
-            env->GetStringUTFChars(option_values[i], NULL));
-    }
-
-    mpv_node_list option_map = {};
-    option_map.num = option_count;
-    option_map.keys = option_keys;
-    option_map.values = option_nodes;
-
-    mpv_node arguments[5] = {};
-    arguments[0].format = MPV_FORMAT_STRING;
-    arguments[0].u.string = const_cast<char *>("loadfile");
-    arguments[1].format = MPV_FORMAT_STRING;
-    arguments[1].u.string = const_cast<char *>(path);
-    arguments[2].format = MPV_FORMAT_STRING;
-    arguments[2].u.string = const_cast<char *>(flags);
-    arguments[3].format = MPV_FORMAT_INT64;
-    arguments[3].u.int64 = -1;
-    arguments[4].format = MPV_FORMAT_NODE_MAP;
-    arguments[4].u.list = &option_map;
-
-    mpv_node_list command_array = {};
-    command_array.num = ARRAYLEN(arguments);
-    command_array.values = arguments;
-
-    mpv_node command = {};
-    command.format = MPV_FORMAT_NODE_ARRAY;
-    command.u.list = &command_array;
-
-    mpv_node result = {};
-    const int err = mpv_command_node(g_mpv, &command, &result);
-    if (err < 0)
-        ALOGE("loadfile command returned error %s", mpv_error_string(err));
-    mpv_free_node_contents(&result);
-
-    for (jsize i = 0; i < option_count; ++i) {
-        env->ReleaseStringUTFChars(option_names[i], option_keys[i]);
-        env->ReleaseStringUTFChars(option_values[i], option_nodes[i].u.string);
-        env->DeleteLocalRef(option_names[i]);
-        env->DeleteLocalRef(option_values[i]);
-    }
-    env->ReleaseStringUTFChars(jpath, path);
-    env->ReleaseStringUTFChars(jflags, flags);
-
-    return err;
-}
-
 jni_func(jint, commandAsync, jobjectArray jarray, jlong userdata) {
     CHECK_MPV_INIT();
 
@@ -224,3 +149,4 @@ jni_func(void, abortAsyncCommand, jlong userdata) {
     CHECK_MPV_INIT();
     mpv_abort_async_command(g_mpv, (uint64_t)userdata);
 }
+
