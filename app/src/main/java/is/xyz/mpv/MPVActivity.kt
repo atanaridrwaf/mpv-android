@@ -2033,93 +2033,43 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
      * Attach saved external subtitles to the playlist entry before mpv starts opening it. This
      * makes the tracks available during mpv's initial stream selection, rather than adding them
      * from FILE_LOADED after the first embedded-subtitle frame may already have been rendered.
-     * The saved primary/secondary choices must be part of the same loadfile options as well:
-     * setting secondary-sid from FILE_LOADED is asynchronous and can otherwise happen one frame
-     * after an explicitly loaded external subtitle was auto-selected as the primary subtitle.
      */
     private fun persistedSubtitleLoadOptions(mediaPath: String): String? {
         if (!fileStatePersistenceEnabled())
             return null
 
         val prefs = getDefaultSharedPreferences(applicationContext)
-        class SavedSubtitle(
-            val kind: String?,
-            val external: String?,
-            val sid: Int?
-        )
-
-        fun readSavedSubtitle(kindKey: String, externalKey: String, sidKey: String): SavedSubtitle {
-            val sidPreference = perFileKey(sidKey, mediaPath)
-            return SavedSubtitle(
-                kind = prefs.getString(perFileKey(kindKey, mediaPath), null),
-                external = prefs.getString(perFileKey(externalKey, mediaPath), null)
-                    ?.takeIf { it.isNotEmpty() },
-                sid = if (prefs.contains(sidPreference))
-                    prefs.getInt(sidPreference, -1)
-                else
-                    null
-            )
-        }
-
-        val primary = readSavedSubtitle(PREF_SUB_KIND, PREF_SUB_EXTERNAL, PREF_SUB_SID)
-        val secondary = readSavedSubtitle(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL, PREF_SUB2_SID)
         val externalFiles = linkedSetOf<String>()
-        for (selection in listOf(primary, secondary)) {
-            if (selection.kind == PREF_SUB_KIND_EXTERNAL)
-                selection.external?.let(externalFiles::add)
+
+        fun addSavedExternal(kindKey: String, externalKey: String) {
+            val kind = prefs.getString(perFileKey(kindKey, mediaPath), null)
+            if (kind != PREF_SUB_KIND_EXTERNAL)
+                return
+            prefs.getString(perFileKey(externalKey, mediaPath), null)
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(externalFiles::add)
         }
 
-        val options = mutableListOf<String>()
+        addSavedExternal(PREF_SUB_KIND, PREF_SUB_EXTERNAL)
+        addSavedExternal(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL)
+        if (externalFiles.isEmpty())
+            return null
 
         // loadfile's fourth argument is a comma-separated key/value list. Fixed-length quoting
         // keeps commas, colons and non-ASCII characters in Android paths unambiguous to mpv.
-        fun quoteOptionValue(value: String): String {
-            val utf8Length = value.toByteArray(Charsets.UTF_8).size
-            return "%${utf8Length}%$value"
+        fun quotePath(path: String): String {
+            val utf8Length = path.toByteArray(Charsets.UTF_8).size
+            return "%${utf8Length}%$path"
         }
 
-        if (externalFiles.size == 1) {
-            // -append takes one literal path, so only loadfile's outer key/value parser needs
-            // quoting. In particular, content:// and commas remain part of the filename.
-            options += "sub-files-append=${quoteOptionValue(externalFiles.first())}"
-        } else if (externalFiles.size > 1) {
-            // -add parses a Unix ':'-separated path list after loadfile has parsed its own
-            // comma-separated option list. Escape the inner list first, then quote that complete
-            // value so the backslashes survive the outer parser.
-            fun escapePathListItem(path: String): String = buildString(path.length) {
-                for (char in path) {
-                    if (char == '\\' || char == ':')
-                        append('\\')
-                    append(char)
-                }
-            }
+        if (externalFiles.size == 1)
+            return "sub-files-append=${quotePath(externalFiles.first())}"
 
-            val pathList = externalFiles.joinToString(":") { escapePathListItem(it) }
-            options += "sub-files-add=${quoteOptionValue(pathList)}"
-        }
-
-        fun initialTrackOption(selection: SavedSubtitle): String? {
-            return when (selection.kind) {
-                // Explicitly loaded subtitle files win mpv's automatic subtitle ranking. With
-                // both slots set to auto, mpv picks them in the primary/secondary load order.
-                PREF_SUB_KIND_EXTERNAL -> selection.external?.let { "auto" }
-                PREF_SUB_KIND_SID -> selection.sid?.let { if (it < 0) "no" else it.toString() }
-                else -> null
-            }
-        }
-
-        var primaryOption = initialTrackOption(primary)
-        val secondaryOption = initialTrackOption(secondary)
-        if (primaryOption == null && secondary.kind == PREF_SUB_KIND_EXTERNAL) {
-            // A legacy/incomplete snapshot may only contain the secondary external filename.
-            // Prevent mpv from auto-selecting that file into the primary slot before it chooses
-            // the same explicitly loaded track for secondary-sid=auto.
-            primaryOption = "no"
-        }
-        primaryOption?.let { options += "sid=$it" }
-        secondaryOption?.let { options += "secondary-sid=$it" }
-
-        return options.takeIf { it.isNotEmpty() }?.joinToString(",")
+        // The outer quote belongs to loadfile's key/value parser; the inner quotes survive for
+        // sub-files-add's path-list parser. This preserves content URIs and filenames containing
+        // ':' or ',' even when both subtitle slots reference external files.
+        val pathList = externalFiles.joinToString(":", transform = ::quotePath)
+        return "sub-files-add=${quotePath(pathList)}"
     }
 
     private fun loadFileWithPersistedSubtitles(path: String, flags: String = "replace") {

@@ -107,6 +107,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("hwdec", hwdec)
         MPVLib.setOptionString("hwdec-codecs", "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1")
         MPVLib.setOptionString("ao", "audiotrack,opensles")
+        // Keep Android's audio clock alive while paused. Restarting AudioTrack can advance that
+        // clock enough for mpv to drop the first queued video frame; silence keeps resume both
+        // frame-continuous and immediate without an expensive exact seek.
+        MPVLib.setOptionString("audio-stream-silence", "yes")
         MPVLib.setOptionString("audio-set-media-role", "yes")
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
