@@ -119,8 +119,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         val commandValueSec: Double,
         val directionalKeyframeDirection: Int,
         val issuedAtMs: Long,
-        val frameFloor: Long,
-        val exactResume: Boolean
+        val frameFloor: Long
     ) {
         var superseded = false
         var commandReplyReceived = false
@@ -144,15 +143,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // Keeping it separate from mpv's real "pause" property makes play/pause controls symmetric:
     // the user can change their mind while a slow exact seek is still completing.
     private var scrubPlaybackPaused: Boolean? = null
-
-    // MediaCodec/AudioTrack can retain queued timing across a plain pause toggle. Remember the
-    // frame confirmed by mpv after pausing, then seek back to that exact PTS before unpausing so
-    // playback cannot restart from a later queued frame.
-    @Volatile
-    private var exactPauseCaptureGeneration = 0L
-    private var exactPauseCaptureCounter = 0L
-    private var exactPausedFrameSec: Double? = null
-    private var exactResumeWaitingForCaptureGeneration: Long? = null
 
     private val scrubFrameGraceRunnable = Runnable { finishScrubSeekAfterFrameGrace() }
     private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
@@ -1691,7 +1681,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             '#' -> cycleAudio()
             '<' -> playlistPrev()
             '>' -> playlistNext()
-            ' ' -> if (event.repeatCount == 0) togglePlaybackPauseFromUi()
 
             else -> unhandled++
         }
@@ -1705,17 +1694,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK -> cycleAudio()
             KeyEvent.KEYCODE_MEDIA_PREVIOUS -> playlistPrev()
             KeyEvent.KEYCODE_MEDIA_NEXT -> playlistNext()
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ->
-                if (event.repeatCount == 0) togglePlaybackPauseFromUi()
-            KeyEvent.KEYCODE_MEDIA_PLAY -> setPlaybackPausedFromUi(false)
-            KeyEvent.KEYCODE_MEDIA_PAUSE -> setPlaybackPausedFromUi(true)
             KeyEvent.KEYCODE_INFO -> toggleControls()
             KeyEvent.KEYCODE_MENU -> openTopMenu()
             KeyEvent.KEYCODE_GUIDE -> openTopMenu()
-            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> player.cyclePause()
 
             // (overrides a default binding)
-            KeyEvent.KEYCODE_ENTER -> togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_ENTER -> player.cyclePause()
 
             else -> unhandled++
         }
@@ -2048,43 +2033,93 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
      * Attach saved external subtitles to the playlist entry before mpv starts opening it. This
      * makes the tracks available during mpv's initial stream selection, rather than adding them
      * from FILE_LOADED after the first embedded-subtitle frame may already have been rendered.
+     * The saved primary/secondary choices must be part of the same loadfile options as well:
+     * setting secondary-sid from FILE_LOADED is asynchronous and can otherwise happen one frame
+     * after an explicitly loaded external subtitle was auto-selected as the primary subtitle.
      */
     private fun persistedSubtitleLoadOptions(mediaPath: String): String? {
         if (!fileStatePersistenceEnabled())
             return null
 
         val prefs = getDefaultSharedPreferences(applicationContext)
-        val externalFiles = linkedSetOf<String>()
+        class SavedSubtitle(
+            val kind: String?,
+            val external: String?,
+            val sid: Int?
+        )
 
-        fun addSavedExternal(kindKey: String, externalKey: String) {
-            val kind = prefs.getString(perFileKey(kindKey, mediaPath), null)
-            if (kind != PREF_SUB_KIND_EXTERNAL)
-                return
-            prefs.getString(perFileKey(externalKey, mediaPath), null)
-                ?.takeIf { it.isNotEmpty() }
-                ?.let(externalFiles::add)
+        fun readSavedSubtitle(kindKey: String, externalKey: String, sidKey: String): SavedSubtitle {
+            val sidPreference = perFileKey(sidKey, mediaPath)
+            return SavedSubtitle(
+                kind = prefs.getString(perFileKey(kindKey, mediaPath), null),
+                external = prefs.getString(perFileKey(externalKey, mediaPath), null)
+                    ?.takeIf { it.isNotEmpty() },
+                sid = if (prefs.contains(sidPreference))
+                    prefs.getInt(sidPreference, -1)
+                else
+                    null
+            )
         }
 
-        addSavedExternal(PREF_SUB_KIND, PREF_SUB_EXTERNAL)
-        addSavedExternal(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL)
-        if (externalFiles.isEmpty())
-            return null
+        val primary = readSavedSubtitle(PREF_SUB_KIND, PREF_SUB_EXTERNAL, PREF_SUB_SID)
+        val secondary = readSavedSubtitle(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL, PREF_SUB2_SID)
+        val externalFiles = linkedSetOf<String>()
+        for (selection in listOf(primary, secondary)) {
+            if (selection.kind == PREF_SUB_KIND_EXTERNAL)
+                selection.external?.let(externalFiles::add)
+        }
+
+        val options = mutableListOf<String>()
 
         // loadfile's fourth argument is a comma-separated key/value list. Fixed-length quoting
         // keeps commas, colons and non-ASCII characters in Android paths unambiguous to mpv.
-        fun quotePath(path: String): String {
-            val utf8Length = path.toByteArray(Charsets.UTF_8).size
-            return "%${utf8Length}%$path"
+        fun quoteOptionValue(value: String): String {
+            val utf8Length = value.toByteArray(Charsets.UTF_8).size
+            return "%${utf8Length}%$value"
         }
 
-        if (externalFiles.size == 1)
-            return "sub-files-append=${quotePath(externalFiles.first())}"
+        if (externalFiles.size == 1) {
+            // -append takes one literal path, so only loadfile's outer key/value parser needs
+            // quoting. In particular, content:// and commas remain part of the filename.
+            options += "sub-files-append=${quoteOptionValue(externalFiles.first())}"
+        } else if (externalFiles.size > 1) {
+            // -add parses a Unix ':'-separated path list after loadfile has parsed its own
+            // comma-separated option list. Escape the inner list first, then quote that complete
+            // value so the backslashes survive the outer parser.
+            fun escapePathListItem(path: String): String = buildString(path.length) {
+                for (char in path) {
+                    if (char == '\\' || char == ':')
+                        append('\\')
+                    append(char)
+                }
+            }
 
-        // The outer quote belongs to loadfile's key/value parser; the inner quotes survive for
-        // sub-files-add's path-list parser. This preserves content URIs and filenames containing
-        // ':' or ',' even when both subtitle slots reference external files.
-        val pathList = externalFiles.joinToString(":", transform = ::quotePath)
-        return "sub-files-add=${quotePath(pathList)}"
+            val pathList = externalFiles.joinToString(":") { escapePathListItem(it) }
+            options += "sub-files-add=${quoteOptionValue(pathList)}"
+        }
+
+        fun initialTrackOption(selection: SavedSubtitle): String? {
+            return when (selection.kind) {
+                // Explicitly loaded subtitle files win mpv's automatic subtitle ranking. With
+                // both slots set to auto, mpv picks them in the primary/secondary load order.
+                PREF_SUB_KIND_EXTERNAL -> selection.external?.let { "auto" }
+                PREF_SUB_KIND_SID -> selection.sid?.let { if (it < 0) "no" else it.toString() }
+                else -> null
+            }
+        }
+
+        var primaryOption = initialTrackOption(primary)
+        val secondaryOption = initialTrackOption(secondary)
+        if (primaryOption == null && secondary.kind == PREF_SUB_KIND_EXTERNAL) {
+            // A legacy/incomplete snapshot may only contain the secondary external filename.
+            // Prevent mpv from auto-selecting that file into the primary slot before it chooses
+            // the same explicitly loaded track for secondary-sid=auto.
+            primaryOption = "no"
+        }
+        primaryOption?.let { options += "sid=$it" }
+        secondaryOption?.let { options += "secondary-sid=$it" }
+
+        return options.takeIf { it.isNotEmpty() }?.joinToString(",")
     }
 
     private fun loadFileWithPersistedSubtitles(path: String, flags: String = "replace") {
@@ -3696,10 +3731,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPause() {
-            setPlaybackPausedFromUi(true)
+            player.paused = true
         }
         override fun onPlay() {
-            setPlaybackPausedFromUi(false)
+            player.paused = false
         }
         override fun onSeekTo(pos: Long) {
             player.timePos = (pos / 1000.0)
@@ -3835,17 +3870,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String, value: Boolean) {
-        // Capture only after mpv confirms pause. Reading playback-time on the event thread also
-        // avoids blocking Android's main thread on mpv's core lock during hardware decoding.
-        val pauseCaptureGeneration = if (property == "pause" && value)
-            exactPauseCaptureGeneration
-        else
-            0L
-        val pausedFrameSec = if (property == "pause" && value)
-            readScrubPlaybackTimeFromMpv()
-        else
-            null
-
         if (property == "seeking") {
             // Property callbacks arrive on mpv's event thread. Read the final high-resolution
             // position there so the Android main thread never blocks on mpv_get_property.
@@ -3885,23 +3909,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (metaUpdated || property == "mute")
             handleAudioFocus()
-
-        if (property == "pause") {
-            eventUiHandler.post {
-                if (value) {
-                    if (pauseCaptureGeneration != 0L) {
-                        completeExactPauseFrameCapture(pauseCaptureGeneration, pausedFrameSec)
-                    } else if (scrubPlaybackPaused == null && psc.pause) {
-                        // Also remember pauses initiated by another foreground control. If the
-                        // in-app play control resumes them, it still gets exact-frame behavior.
-                        exactPausedFrameSec = validPlaybackTime(pausedFrameSec)
-                            ?: cachedPlaybackTimeSec()
-                    }
-                } else if (scrubPlaybackPaused == null && exactPauseCaptureGeneration == 0L) {
-                    clearExactPauseResumeState()
-                }
-            }
-        }
 
         if (!activityIsForeground) return
         eventUiHandler.post { eventPropertyUi(property, value) }
@@ -4099,7 +4106,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         activeScrubSeek = null
         scrubSeekInFlight = false
         scrubPlaybackPaused = null
-        clearExactPauseResumeState()
         if (desiredPlaybackPaused != null) {
             player.paused = desiredPlaybackPaused
             updatePlaybackStatus(desiredPlaybackPaused)
@@ -4134,13 +4140,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         val playbackPaused = scrubPlaybackPaused ?: return
         scrubPlaybackPaused = null
-        if (playbackPaused) {
-            exactPausedFrameSec = validPlaybackTime(latestPlaybackTimeSec)
-                ?: exactPausedFrameSec
-                ?: cachedPlaybackTimeSec()
-        } else {
-            clearExactPauseResumeState()
-        }
         player.paused = playbackPaused
         // Setting the same mpv value does not necessarily emit a property event.
         updatePlaybackStatus(playbackPaused)
@@ -4148,116 +4147,18 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private fun togglePlaybackPauseFromUi() {
         val playbackPaused = scrubPlaybackPaused
-            ?: if (exactPauseCaptureGeneration != 0L) true else psc.pause
-        setPlaybackPausedFromUi(!playbackPaused)
-    }
-
-    private fun setPlaybackPausedFromUi(paused: Boolean) {
-        val heldPlaybackPaused = scrubPlaybackPaused
-        if (heldPlaybackPaused != null) {
-            if (heldPlaybackPaused == paused)
-                return
-
-            // Record the user's desired post-seek state, but keep mpv physically paused until the
-            // newest exact seek has produced its frame. Decoding while playback runs makes heavy
-            // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
-            scrubPlaybackPaused = paused
-            player.paused = true
-            updatePlaybackStatus(paused)
+        if (playbackPaused == null) {
+            player.cyclePause()
             return
         }
 
-        // The observed property is deliberately used instead of mpv_get_property on Android's
-        // main thread. A pending capture already represents a pause request whose callback has
-        // not reached the cache yet.
-        val playerPaused = if (exactPauseCaptureGeneration != 0L) true else psc.pause
-        if (playerPaused == paused) {
-            updatePlaybackStatus(paused)
-            return
-        }
-
-        if (paused)
-            pausePlaybackAtExactFrame()
-        else
-            resumePlaybackFromExactFrame()
-    }
-
-    private fun pausePlaybackAtExactFrame() {
-        val generation = ++exactPauseCaptureCounter
-        exactPausedFrameSec = null
-        exactResumeWaitingForCaptureGeneration = null
-        exactPauseCaptureGeneration = generation
-
+        // Record the user's desired post-seek state, but keep mpv physically paused until the
+        // newest exact seek has produced its frame. Decoding while playback runs makes heavy
+        // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
+        val newPlaybackPaused = !playbackPaused
+        scrubPlaybackPaused = newPlaybackPaused
         player.paused = true
-        updatePlaybackStatus(true)
-
-        // A normal pause change produces a property callback immediately. This guarded fallback
-        // covers a redundant/vendor-delayed callback without ever reading mpv on the UI thread.
-        eventUiHandler.postDelayed(
-            { completeExactPauseFrameCapture(generation, null) },
-            EXACT_PAUSE_CAPTURE_FALLBACK_MS
-        )
-    }
-
-    private fun resumePlaybackFromExactFrame() {
-        scrubPlaybackPaused = false
-        player.paused = true
-        updatePlaybackStatus(false)
-
-        val captureGeneration = exactPauseCaptureGeneration
-        if (captureGeneration != 0L) {
-            exactResumeWaitingForCaptureGeneration = captureGeneration
-            return
-        }
-
-        startExactResumeSeek()
-    }
-
-    private fun completeExactPauseFrameCapture(generation: Long, playbackTimeSec: Double?) {
-        if (generation == 0L || exactPauseCaptureGeneration != generation)
-            return
-
-        exactPauseCaptureGeneration = 0L
-        exactPausedFrameSec = validPlaybackTime(playbackTimeSec) ?: cachedPlaybackTimeSec()
-
-        if (exactResumeWaitingForCaptureGeneration != generation)
-            return
-
-        exactResumeWaitingForCaptureGeneration = null
-        if (scrubPlaybackPaused == false)
-            startExactResumeSeek()
-        else
-            finishScrubPlaybackHoldIfReady()
-    }
-
-    private fun startExactResumeSeek() {
-        val targetSec = exactPausedFrameSec
-        val hasVideo = try { player.vid != -1 } catch (_: Throwable) { false }
-        if (!hasVideo || targetSec == null) {
-            finishScrubPlaybackHoldIfReady()
-            return
-        }
-
-        Log.v(TAG, "restoring paused frame before resume @ $targetSec")
-        queueScrubSeek(
-            targetSec = targetSec,
-            exact = true,
-            commandValueSec = targetSec,
-            commandMode = "absolute+exact",
-            exactResume = true
-        )
-    }
-
-    private fun validPlaybackTime(value: Double?): Double? =
-        value?.takeIf { it.isFinite() && it >= 0.0 }
-
-    private fun cachedPlaybackTimeSec(): Double? =
-        psc.position.takeIf { it >= 0L }?.div(1000.0)
-
-    private fun clearExactPauseResumeState() {
-        exactPauseCaptureGeneration = 0L
-        exactResumeWaitingForCaptureGeneration = null
-        exactPausedFrameSec = null
+        updatePlaybackStatus(newPlaybackPaused)
     }
 
     private fun invalidateGestureStableTargetCheck() {
@@ -4385,8 +4286,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         exact: Boolean,
         commandValueSec: Double,
         commandMode: String,
-        directionalKeyframeDirection: Int = 0,
-        exactResume: Boolean = false
+        directionalKeyframeDirection: Int = 0
     ): Boolean {
         supersedeActiveScrubSeekIfTargetChanged(targetSec, exact)
 
@@ -4398,8 +4298,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             commandValueSec = commandValueSec,
             directionalKeyframeDirection = directionalKeyframeDirection,
             issuedAtMs = SystemClock.uptimeMillis(),
-            frameFloor = playerSurfaceFrameSerial,
-            exactResume = exactResume
+            frameFloor = playerSurfaceFrameSerial
         )
 
         // Install the request before entering JNI. A very fast COMMAND_REPLY is posted back to the
@@ -4485,17 +4384,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         latestPlaybackTimeSec = value
         if (request.exact) {
             val distance = abs(value - request.targetSec)
-            val reachedTolerance = if (request.exactResume)
-                EXACT_RESUME_TARGET_REACHED_TOLERANCE_SEC
-            else
-                SCRUB_TARGET_REACHED_TOLERANCE_SEC
-            val nearTolerance = if (request.exactResume)
-                reachedTolerance
-            else
-                SCRUB_TARGET_NEAR_TOLERANCE_SEC
-            if (distance <= nearTolerance)
+            if (distance <= SCRUB_TARGET_NEAR_TOLERANCE_SEC)
                 request.targetPositionNear = true
-            if (distance <= reachedTolerance)
+            if (distance <= SCRUB_TARGET_REACHED_TOLERANCE_SEC)
                 request.targetPositionSeen = true
         }
     }
@@ -4595,10 +4486,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
         if (request.exact && !request.superseded && reason != "timeout") {
             val elapsed = (SystemClock.uptimeMillis() - request.issuedAtMs).coerceAtLeast(1L)
-            val operation = if (request.exactResume) "exact resume seek" else "exact scrub seek"
             Log.v(
                 TAG,
-                "$operation generation ${request.generation} completed by $reason in ${elapsed}ms"
+                "exact scrub seek generation ${request.generation} completed by $reason in ${elapsed}ms"
             )
         }
 
@@ -4899,10 +4789,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val SCRUB_TARGET_COMPARE_EPSILON_SEC = 0.0005
         private const val SCRUB_TARGET_REACHED_TOLERANCE_SEC = 0.075
         private const val SCRUB_TARGET_NEAR_TOLERANCE_SEC = 0.75
-        // The captured value is the full-precision PTS of the displayed paused frame. Keep the
-        // resume tolerance well below a normal frame interval so an adjacent frame cannot pass.
-        private const val EXACT_RESUME_TARGET_REACHED_TOLERANCE_SEC = 0.002
-        private const val EXACT_PAUSE_CAPTURE_FALLBACK_MS = 100L
         private const val SCRUB_FRAME_GRACE_MS = 350L
         private const val SCRUB_SEEK_HARD_TIMEOUT_MS = 45_000L
         private const val KEYFRAME_DIRECTION_EPSILON_SEC = 0.001
