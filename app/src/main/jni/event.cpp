@@ -51,29 +51,6 @@ static void sendEventToJava(JNIEnv *env, int event)
     env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_event, event);
 }
 
-static void sendHookToJava(JNIEnv *env, mpv_event_hook *hook)
-{
-    if (!hook)
-        return;
-
-    jstring jname = env->NewStringUTF(hook->name);
-    env->CallStaticVoidMethod(mpv_MPVLib, mpv_MPVLib_eventHook_S, jname);
-    if (jname)
-        env->DeleteLocalRef(jname);
-
-    // Never strand mpv in a synchronous hook if an observer unexpectedly throws. The Java
-    // exception is logged, cleared, and normal loading continues with whatever was applied.
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    int result = mpv_hook_continue(g_mpv, hook->id);
-    if (result < 0)
-        ALOGE("mpv_hook_continue(%s) returned error %s", hook->name,
-            mpv_error_string(result));
-}
-
 static void sendEndFileEventToJava(JNIEnv *env, mpv_event_end_file *event)
 {
     const bool reached_eof = event && event->reason == MPV_END_FILE_REASON_EOF;
@@ -146,10 +123,6 @@ void *event_thread(void *arg)
             sendCommandReplyToJava(env, mp_event);
             // Preserve the generic event callback for any existing observers.
             sendEventToJava(env, mp_event->event_id);
-            break;
-        case MPV_EVENT_HOOK:
-            ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
-            sendHookToJava(env, (mpv_event_hook*)mp_event->data);
             break;
         default:
             ALOGV("event: %s\n", mpv_event_name(mp_event->event_id));
