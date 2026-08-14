@@ -1,0 +1,403 @@
+diff --git a/player/playloop.c b/player/playloop.c
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -171,13 +171,23 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
+     if (internal_paused != mpctx->paused) {
+         mpctx->paused = internal_paused;
+ 
+-        if (mpctx->ao) {
+-            bool eof = mpctx->audio_status == STATUS_EOF;
+-            ao_set_paused(mpctx->ao, internal_paused, eof);
+-        }
+-
+-        if (mpctx->video_out)
+-            vo_set_paused(mpctx->video_out, internal_paused);
++        bool eof = mpctx->audio_status == STATUS_EOF;
++        if (internal_paused) {
++            // Stop audio first so no more samples can pass the video frame at
++            // which this pause transaction settles.
++            if (mpctx->ao)
++                ao_set_paused(mpctx->ao, true, eof);
++            if (mpctx->video_out)
++                vo_set_paused(mpctx->video_out, true);
++        } else {
++            // Ordered Android VOs acknowledge their lightweight resume state
++            // here before AudioTrack.play(). This starts both clocks together
++            // and avoids compensating for a head-start by dropping video.
++            if (mpctx->video_out)
++                vo_set_paused(mpctx->video_out, false);
++            if (mpctx->ao)
++                ao_set_paused(mpctx->ao, false, eof);
++        }
+ 
+         mpctx->osd_function = 0;
+         mpctx->osd_force_update = true;
+diff --git a/video/out/vo.h b/video/out/vo.h
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -205,6 +205,10 @@ enum {
+     VO_CAP_FRAMEOWNER   = 1 << 5,
+     // VO does handle mp_image_params.vflip
+     VO_CAP_VFLIP        = 1 << 6,
++    // The VO has a threaded, ordered presentation path. vo.c may hold a frame
++    // queued behind the visible frame while paused and apply pause/resume
++    // controls before allowing another frame into the driver.
++    VO_CAP_ORDERED_PAUSE = 1 << 7,
+ };
+ 
+ enum {
+diff --git a/video/out/vo.c b/video/out/vo.c
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -137,6 +137,11 @@ struct vo_internal {
+     bool want_redraw;               // redraw request from VO to player
+     bool send_reset;                // send VOCTRL_RESET
+     bool paused;
++    bool pause_hold_frame;          // keep the frame after the visible one queued
++    int64_t pause_started;
++    int64_t frame_queued_at;
++    uint64_t pause_generation;
++    uint64_t pause_generation_applied;
+     bool visible;
+     bool wakeup_on_done;
+     int queued_events;              // event mask for the user
+@@ -702,6 +707,9 @@ static void forget_frames(struct vo *vo)
+     in->delayed_count = 0;
+     talloc_free(in->frame_queued);
+     in->frame_queued = NULL;
++    in->pause_hold_frame = false;
++    in->pause_started = 0;
++    in->frame_queued_at = 0;
+     in->current_frame_id += VO_MAX_REQ_FRAMES + 1;
+     // don't unref current_frame; we always want to be able to redraw it
+     if (in->current_frame) {
+@@ -883,6 +891,7 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
+     in->hasframe = true;
+     frame->frame_id = ++(in->current_frame_id);
+     in->frame_queued = frame;
++    in->frame_queued_at = mp_time_ns();
+     in->wakeup_pts = frame->display_synced
+                    ? 0 : frame->pts + MPMAX(frame->duration, 0);
+     wakeup_locked(vo);
+@@ -895,7 +904,10 @@ void vo_wait_frame(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+     mp_mutex_lock(&in->lock);
+-    while (in->frame_queued || in->rendering)
++    while ((in->frame_queued &&
++            !((vo->driver->caps & VO_CAP_ORDERED_PAUSE) && in->paused &&
++              in->pause_hold_frame)) ||
++           in->rendering)
+         mp_cond_wait(&in->wakeup, &in->lock);
+     mp_mutex_unlock(&in->lock);
+ }
+@@ -915,7 +927,7 @@ static void wait_until(struct vo *vo, int64_t target)
+     mp_mutex_unlock(&in->lock);
+ }
+ 
+-static bool render_frame(struct vo *vo)
++static bool render_frame(struct vo *vo, bool driver_paused)
+ {
+     struct vo_internal *in = vo->in;
+     struct vo_frame *frame = NULL;
+@@ -925,10 +937,25 @@ static bool render_frame(struct vo *vo)
+ 
+     mp_mutex_lock(&in->lock);
+ 
++    // For ordered VOs, never submit a frame while the driver's pause state is
++    // stale. This closes the small window between changing the player property
++    // and delivering VOCTRL_PAUSE/RESUME on the VO thread.
++    if ((vo->driver->caps & VO_CAP_ORDERED_PAUSE) &&
++        (in->paused != driver_paused ||
++         in->pause_generation != in->pause_generation_applied))
++        goto done;
++
++    // frame_queued is the frame immediately following current_frame. Keep it
++    // intact for resume instead of promoting it merely because pause woke the
++    // VO thread.
++    if (in->paused && in->pause_hold_frame && in->frame_queued)
++        goto done;
++
+     if (in->frame_queued) {
+         talloc_free(in->current_frame);
+         in->current_frame = in->frame_queued;
+         in->frame_queued = NULL;
++        in->frame_queued_at = 0;
+     } else if (in->paused || !in->current_frame || !in->hasframe ||
+                (in->current_frame->display_synced && in->current_frame->num_vsyncs < 1) ||
+                !in->current_frame->display_synced)
+@@ -1063,6 +1090,13 @@ static bool render_frame(struct vo *vo)
+     if (in->frame_queued && in->frame_queued->display_synced)
+         more_frames = true;
+ 
++    // A seek while paused clears the hold so its target frame can be shown.
++    // Once that frame is actually rendered, restore the barrier for anything
++    // queued behind it.
++    if ((vo->driver->caps & VO_CAP_ORDERED_PAUSE) && in->paused &&
++        in->current_frame && in->hasframe_rendered)
++        in->pause_hold_frame = true;
++
+     mp_cond_broadcast(&in->wakeup); // for vo_wait_frame()
+ 
+ done:
+@@ -1137,14 +1171,71 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+     read_opts(vo);
+     update_display_fps(vo);
+     vo_event(vo, VO_EVENT_WIN_STATE);
++    bool ordered_pause = vo->driver->caps & VO_CAP_ORDERED_PAUSE;
++    if (ordered_pause)
++        MP_INFO(vo, "Seamless video pause v4: ordered VO barrier enabled\n");
+ 
+     while (1) {
+         mp_dispatch_queue_process(vo->in->dispatch, 0);
+         if (in->terminate)
+             break;
+         stats_event(in->stats, "iterations");
+         vo->driver->control(vo, VOCTRL_CHECK_EVENTS, NULL);
+-        bool working = render_frame(vo);
++
++        // gpu-next normally receives pause controls after render_frame(). That
++        // permits one queued frame to cross the pause boundary and, on resume,
++        // renders once with the driver's stale paused state. Ordered VOs apply
++        // the transition first; render_frame() atomically declines to render
++        // if the requested state changes again in between.
++        if (ordered_pause) {
++            mp_mutex_lock(&in->lock);
++            bool send_pause = in->paused != vo_paused;
++            bool requested_pause = in->paused;
++            uint64_t pause_generation = in->pause_generation;
++            bool process_pause = send_pause ||
++                pause_generation != in->pause_generation_applied;
++            mp_mutex_unlock(&in->lock);
++            if (process_pause) {
++                if (send_pause) {
++                    vo->driver->control(vo, requested_pause ? VOCTRL_PAUSE
++                                                            : VOCTRL_RESUME, NULL);
++                    vo_paused = requested_pause;
++                }
++                mp_mutex_lock(&in->lock);
++                if (in->pause_generation == pause_generation &&
++                    in->paused == vo_paused)
++                {
++                    // Finalize the held frame at the actual VO resume boundary,
++                    // while AudioTrack is still paused. This includes any VO wake
++                    // latency in the PTS shift, so the frame cannot become late.
++                    if (!vo_paused && in->pause_started && in->pause_hold_frame &&
++                        in->frame_queued &&
++                        !in->frame_queued->display_synced)
++                    {
++                        int64_t hold_start = in->pause_started;
++                        if (in->frame_queued_at > hold_start)
++                            hold_start = in->frame_queued_at;
++                        int64_t hold_time = MPMAX(mp_time_ns() - hold_start, 0);
++                        in->frame_queued->pts += hold_time;
++                        if (in->wakeup_pts)
++                            in->wakeup_pts += hold_time;
++                    }
++                    if (!vo_paused) {
++                        in->pause_hold_frame = false;
++                        in->pause_started = 0;
++                    }
++                    in->pause_generation_applied = pause_generation;
++                    mp_cond_broadcast(&in->wakeup);
++                    MP_VERBOSE(vo, "Seamless video pause v4: driver=%s "
++                               "generation=%llu applied\n",
++                               vo_paused ? "paused" : "resumed",
++                               (unsigned long long)pause_generation);
++                }
++                mp_mutex_unlock(&in->lock);
++            }
++        }
++
++        bool working = render_frame(vo, vo_paused);
+         int64_t now = mp_time_ns();
+         int64_t wait_until = now + MP_TIME_S_TO_NS(working ? 0 : 1000);
+         bool wakeup_on_done = false;
+@@ -1176,7 +1267,8 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+         bool send_reset = in->send_reset;
+         in->send_reset = false;
+-        bool send_pause = in->paused != vo_paused;
+-        vo_paused = in->paused;
++        bool send_pause = !ordered_pause && in->paused != vo_paused;
++        if (send_pause)
++            vo_paused = in->paused;
+         mp_mutex_unlock(&in->lock);
+ 
+         if (send_reset)
+@@ -1215,6 +1307,10 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+ 
+         wait_vo(vo, wait_until);
+     }
++    mp_mutex_lock(&in->lock);
++    in->pause_generation_applied = in->pause_generation;
++    mp_cond_broadcast(&in->wakeup);
++    mp_mutex_unlock(&in->lock);
+     forget_frames(vo); // implicitly synchronized
+     talloc_free(in->current_frame);
+     in->current_frame = NULL;
+@@ -1229,13 +1325,43 @@ void vo_set_paused(struct vo *vo, bool paused)
+     struct vo_internal *in = vo->in;
+     mp_mutex_lock(&in->lock);
+     if (in->paused != paused) {
++        int64_t now = mp_time_ns();
++        bool ordered_pause = vo->driver->caps & VO_CAP_ORDERED_PAUSE;
++        uint64_t pause_generation = ++in->pause_generation;
++
++        if (ordered_pause && paused) {
++            // current_frame is either visible or already being submitted. In
++            // both cases, frame_queued belongs strictly after it and must not
++            // cross the pause boundary.
++            in->pause_started = now;
++            in->pause_hold_frame = in->current_frame && in->hasframe_rendered;
++        }
++
+         in->paused = paused;
+         if (in->paused && in->dropped_frame) {
+             in->request_redraw = true;
+             wakeup_core(vo);
+         }
++        if (ordered_pause) {
++            MP_VERBOSE(vo, "Seamless video pause v4: request=%s current=%llu "
++                       "queued=%llu rendering=%d hold=%d\n",
++                       paused ? "pause" : "resume",
++                       (unsigned long long)(in->current_frame
++                           ? in->current_frame->frame_id : 0),
++                       (unsigned long long)(in->frame_queued
++                           ? in->frame_queued->frame_id : 0),
++                       in->rendering, in->pause_hold_frame);
++        }
+         reset_vsync_timings(vo);
+         wakeup_locked(vo);
++
++        // On Android gpu-next, VOCTRL_RESUME is a non-blocking state change on
++        // the dedicated VO thread. Waiting for this acknowledgement prevents
++        // AudioTrack from advancing first, without doing a seek, decoder reset,
++        // GPU flush, or waiting for a decoded frame.
++        while (ordered_pause && !paused && !in->terminate &&
++               in->pause_generation_applied < pause_generation)
++            mp_cond_wait(&in->wakeup, &in->lock);
+     }
+     mp_mutex_unlock(&in->lock);
+ }
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -2867,6 +2867,9 @@ const struct vo_driver video_out_gpu_next = {
+     .caps = VO_CAP_ROTATE90 |
+             VO_CAP_FILM_GRAIN |
+             VO_CAP_VFLIP |
++#if HAVE_ANDROID
++            VO_CAP_ORDERED_PAUSE |
++#endif
+             0x0,
+     .preinit = preinit,
+     .query_format = query_format,
+diff --git a/video/out/vo_gpu.c b/video/out/vo_gpu.c
+--- a/video/out/vo_gpu.c
++++ b/video/out/vo_gpu.c
+@@ -327,7 +327,12 @@ const struct vo_driver video_out_gpu = {
+ const struct vo_driver video_out_gpu = {
+     .description = "Shader-based GPU Renderer",
+     .name = "gpu",
+-    .caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP,
++    .caps = VO_CAP_ROTATE90 |
++            VO_CAP_VFLIP |
++#if HAVE_ANDROID
++            VO_CAP_ORDERED_PAUSE |
++#endif
++            0x0,
+     .preinit = preinit,
+     .query_format = query_format,
+     .reconfig = reconfig,
+diff --git a/video/out/hwdec/hwdec_aimagereader.c b/video/out/hwdec/hwdec_aimagereader.c
+--- a/video/out/hwdec/hwdec_aimagereader.c
++++ b/video/out/hwdec/hwdec_aimagereader.c
+@@ -48,7 +48,7 @@ struct priv_owner {
+         AImageReader *, ANativeWindow **);
+     media_status_t (*AImageReader_setImageListener)(
+         AImageReader *, AImageReader_ImageListener *);
+-    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);
++    media_status_t (*AImageReader_acquireNextImage)(AImageReader *, AImage **);
+     void (*AImageReader_delete)(AImageReader *);
+     media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
+     void (*AImage_delete)(AImage *);
+@@ -65,7 +65,7 @@ struct priv {
+ 
+     mp_mutex lock;
+     mp_cond cond;
+-    bool image_available;
++    uint64_t pending_images;
+ 
+     EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
+         EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *);
+@@ -79,7 +79,7 @@ static const struct { const char *symbol; int offset; } lib_functions[] = {
+     { "AImageReader_newWithUsage", offsetof(struct priv_owner, AImageReader_newWithUsage) },
+     { "AImageReader_getWindow", offsetof(struct priv_owner, AImageReader_getWindow) },
+     { "AImageReader_setImageListener", offsetof(struct priv_owner, AImageReader_setImageListener) },
+-    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },
++    { "AImageReader_acquireNextImage", offsetof(struct priv_owner, AImageReader_acquireNextImage) },
+     { "AImageReader_delete", offsetof(struct priv_owner, AImageReader_delete) },
+     { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
+     { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
+@@ -188,5 +188,6 @@ static int init(struct ra_hwdec *hw)
+ 
+     hwdec_devices_add(hw->devs, &p->hwctx);
++    MP_INFO(hw, "Seamless video pause v4: ordered AImageReader enabled\n");
+ 
+     return 0;
+ }
+@@ -221,7 +222,7 @@ static void image_callback(void *context, AImageReader *reader)
+     struct priv *p = context;
+ 
+     mp_mutex_lock(&p->lock);
+-    p->image_available = true;
++    p->pending_images++;
+     mp_cond_signal(&p->cond);
+     mp_mutex_unlock(&p->lock);
+ }
+@@ -333,25 +334,36 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+         av_mediacodec_release_buffer(buffer, 1);
+     }
+ 
+-    bool image_available = false;
++    bool image_available;
+     mp_mutex_lock(&p->lock);
+-    if (!p->image_available) {
+-        mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
+-        if (!p->image_available)
+-            MP_WARN(mapper, "Waiting for frame timed out!\n");
++    int64_t deadline = mp_time_ns() + MP_TIME_MS_TO_NS(100);
++    while (!p->pending_images) {
++        if (mp_cond_timedwait_until(&p->cond, &p->lock, deadline))
++            break;
+     }
+-    image_available = p->image_available;
+-    p->image_available = false;
++    image_available = p->pending_images > 0;
+     mp_mutex_unlock(&p->lock);
++    if (!image_available)
++        MP_WARN(mapper, "Waiting for frame timed out!\n");
+ 
+-    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
++    // acquireLatestImage() is explicitly allowed to discard every older image
++    // in the queue. Those images are decoded video frames, so using it makes a
++    // pause/resume burst a visible jump. Pair each MediaCodec release with the
++    // oldest available image instead.
++    media_status_t ret = o->AImageReader_acquireNextImage(o->reader, &p->image);
+     if (ret != AMEDIA_OK) {
+-        MP_ERR(mapper, "acquireLatestImage failed: %d\n", ret);
++        MP_ERR(mapper, "acquireNextImage failed: %d\n", ret);
+         // If we merely timed out waiting return success anyway to avoid
+         // flashing frames of render errors.
+         return image_available ? -1 : 0;
+     }
+     mp_assert(p->image);
++    if (image_available) {
++        mp_mutex_lock(&p->lock);
++        if (p->pending_images)
++            p->pending_images--;
++        mp_mutex_unlock(&p->lock);
++    }
+ 
+     AHardwareBuffer *hwbuf = NULL;
+     ret = o->AImage_getHardwareBuffer(p->image, &hwbuf);
