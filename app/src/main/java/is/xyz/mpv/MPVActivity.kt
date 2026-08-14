@@ -559,7 +559,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun hasDisplayableVideoGeometry(): Boolean {
-        val aspect = try { player.getEffectiveVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
+        val aspect = try { player.getVideoAspect() ?: 0.0 } catch (_: Throwable) { 0.0 }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         return aspect > 0.001 && size != null
     }
@@ -575,7 +575,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!::zoomGestures.isInitialized || isAspectMenuGeometrySyncSuppressed())
             return
 
-        val aspect = try { player.getEffectiveVideoAspect() } catch (_: Throwable) { null }
+        val aspect = try { player.getVideoAspect() } catch (_: Throwable) { null }
         val size = try { player.getVideoPixelSize() } catch (_: Throwable) { null }
         val pan = try { player.getPanscan() } catch (_: Throwable) { 0.0 }
 

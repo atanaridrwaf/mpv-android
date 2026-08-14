@@ -512,7 +512,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         get() = MPVLib.getPropertyDouble("estimated-vf-fps")
 
     /**
-     * Returns the video's native aspect ratio. Rotation is taken into account.
+     * Returns the video aspect ratio. Rotation is taken into account.
      */
     fun getVideoAspect(): Double? {
         return MPVLib.getPropertyDouble("video-params/aspect")?.let {
@@ -526,39 +526,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
     }
 
-    /**
-     * Returns the aspect ratio that mpv is currently displaying. This includes
-     * video-aspect-override values coming either from the in-app aspect menu or
-     * from mpv.conf, so the zoom render surface can keep the same geometry as mpv.
-     */
-    fun getEffectiveVideoAspect(): Double? {
-        parseAspectRatio(MPVLib.getPropertyString("video-aspect-override"))?.let {
-            return it
-        }
-        return getVideoAspect()
-    }
-
     fun getPanscan(): Double {
         return MPVLib.getPropertyDouble("panscan") ?: 0.0
-    }
-
-    private fun parseAspectRatio(value: String?): Double? {
-        val trimmed = value?.trim() ?: return null
-        if (trimmed.isEmpty() || trimmed == "-1" || trimmed.equals("no", true))
-            return null
-
-        val parts = trimmed.split(':', limit = 2)
-        val parsed = if (parts.size == 2) {
-            val width = parts[0].toDoubleOrNull()
-            val height = parts[1].toDoubleOrNull()
-            if (width != null && height != null && height != 0.0)
-                width / height
-            else
-                null
-        } else {
-            trimmed.toDoubleOrNull()
-        }
-        return parsed?.takeIf { it > 0.001 }
     }
 
     fun getVideoPixelSize(): Pair<Int, Int>? {
