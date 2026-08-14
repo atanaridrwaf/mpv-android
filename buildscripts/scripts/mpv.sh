@@ -146,82 +146,82 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
-# Keep the video frame already prepared by the VO across a normal pause. mpv
-# otherwise promotes that queued frame while paused, replacing the frame that
-# was visible when pause was requested. Holding it is the video equivalent of
-# pausing AudioTrack without flushing its queued audio: no seek, decoder reset,
-# or resume delay is needed.
-if ! grep -q 'hold_frame_queued' video/out/vo.c; then
+# AImageReader_acquireLatestImage() deliberately discards every queued image
+# except the newest one. With MediaCodec this can consume the first frames after
+# a quick pause/resume before mpv presents them. Acquire the next image instead,
+# and count callbacks so multiple queued images cannot collapse into one boolean
+# notification or add a timeout to resume.
+if ! grep -Fq 'mpv-android: preserve the MediaCodec output order' \
+	video/out/hwdec/hwdec_aimagereader.c; then
 	patch -p1 --forward --batch <<'PATCH'
-diff --git a/video/out/vo.c b/video/out/vo.c
---- a/video/out/vo.c
-+++ b/video/out/vo.c
-@@ -137,6 +137,8 @@ struct vo_internal {
-     bool want_redraw;               // redraw request from VO to player
-     bool send_reset;                // send VOCTRL_RESET
-     bool paused;
-+    bool hold_frame_queued;         // keep the pre-pause frame for resume
-+    int64_t pause_started;
-     bool visible;
-     bool wakeup_on_done;
-     int queued_events;              // event mask for the user
-@@ -702,6 +704,8 @@ static void forget_frames(struct vo *vo)
-     in->delayed_count = 0;
-     talloc_free(in->frame_queued);
-     in->frame_queued = NULL;
-+    in->hold_frame_queued = false;
-+    in->pause_started = 0;
-     in->current_frame_id += VO_MAX_REQ_FRAMES + 1;
-     // don't unref current_frame; we always want to be able to redraw it
-     if (in->current_frame) {
-@@ -895,7 +898,7 @@ void vo_wait_frame(struct vo *vo)
- {
-     struct vo_internal *in = vo->in;
-     mp_mutex_lock(&in->lock);
--    while (in->frame_queued || in->rendering)
-+    while ((in->frame_queued && !in->hold_frame_queued) || in->rendering)
-         mp_cond_wait(&in->wakeup, &in->lock);
-     mp_mutex_unlock(&in->lock);
+diff --git a/video/out/hwdec/hwdec_aimagereader.c b/video/out/hwdec/hwdec_aimagereader.c
+--- a/video/out/hwdec/hwdec_aimagereader.c
++++ b/video/out/hwdec/hwdec_aimagereader.c
+@@ -48,7 +48,7 @@
+         AImageReader *, ANativeWindow **);
+     media_status_t (*AImageReader_setImageListener)(
+         AImageReader *, AImageReader_ImageListener *);
+-    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);
++    media_status_t (*AImageReader_acquireNextImage)(AImageReader *, AImage **);
+     void (*AImageReader_delete)(AImageReader *);
+     media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
+     void (*AImage_delete)(AImage *);
+@@ -65,7 +65,7 @@
+ 
+     mp_mutex lock;
+     mp_cond cond;
+-    bool image_available;
++    int pending_images;
+ 
+     EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
+         EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *);
+@@ -79,7 +79,7 @@
+     { "AImageReader_newWithUsage", offsetof(struct priv_owner, AImageReader_newWithUsage) },
+     { "AImageReader_getWindow", offsetof(struct priv_owner, AImageReader_getWindow) },
+     { "AImageReader_setImageListener", offsetof(struct priv_owner, AImageReader_setImageListener) },
+-    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },
++    { "AImageReader_acquireNextImage", offsetof(struct priv_owner, AImageReader_acquireNextImage) },
+     { "AImageReader_delete", offsetof(struct priv_owner, AImageReader_delete) },
+     { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
+     { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
+@@ -221,7 +221,7 @@
+     struct priv *p = context;
+ 
+     mp_mutex_lock(&p->lock);
+-    p->image_available = true;
++    p->pending_images++;
+     mp_cond_signal(&p->cond);
+     mp_mutex_unlock(&p->lock);
  }
-@@ -926,3 +930,8 @@ static bool render_frame(struct vo *vo)
-     mp_mutex_lock(&in->lock);
--
-+    // A frame queued before pausing belongs immediately after the frame that
-+    // is already visible. Keep it queued instead of advancing the paused
-+    // picture. It will be rendered normally as soon as playback resumes.
-+    if (in->paused && in->hold_frame_queued && in->frame_queued)
-+        goto done;
-+
-     if (in->frame_queued) {
-@@ -1229,6 +1238,28 @@ void vo_set_paused(struct vo *vo, bool paused)
-     struct vo_internal *in = vo->in;
-     mp_mutex_lock(&in->lock);
-     if (in->paused != paused) {
-+        int64_t now = mp_time_ns();
-+
-+        if (paused) {
-+            // Preserve only a frame that was already queued behind a frame
-+            // which reached the display. Initial frames and frames produced
-+            // by a seek while paused must still be allowed through.
-+            in->hold_frame_queued = in->frame_queued && in->hasframe_rendered;
-+            in->pause_started = in->hold_frame_queued ? now : 0;
-+        } else if (in->hold_frame_queued) {
-+            // The retained frame still carries its pre-pause wall-clock PTS.
-+            // Move it by the pause duration so it is neither late nor dropped
-+            // on resume, while preserving the remainder of the frame timing.
-+            if (in->frame_queued && !in->frame_queued->display_synced) {
-+                int64_t pause_duration = MPMAX(now - in->pause_started, 0);
-+                in->frame_queued->pts += pause_duration;
-+                if (in->wakeup_pts)
-+                    in->wakeup_pts += pause_duration;
-+            }
-+            in->hold_frame_queued = false;
-+            in->pause_started = 0;
-+        }
-+
-         in->paused = paused;
-         if (in->paused && in->dropped_frame) {
-             in->request_redraw = true;
+@@ -335,18 +335,22 @@
+ 
+     bool image_available = false;
+     mp_mutex_lock(&p->lock);
+-    if (!p->image_available) {
++    if (!p->pending_images) {
+         mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
+-        if (!p->image_available)
++        if (!p->pending_images)
+             MP_WARN(mapper, "Waiting for frame timed out!\n");
+     }
+-    image_available = p->image_available;
+-    p->image_available = false;
++    if (p->pending_images) {
++        p->pending_images--;
++        image_available = true;
++    }
+     mp_mutex_unlock(&p->lock);
+ 
+-    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
++    // mpv-android: preserve the MediaCodec output order. acquireLatestImage()
++    // explicitly discards older queued images, which skips frames at resume.
++    media_status_t ret = o->AImageReader_acquireNextImage(o->reader, &p->image);
+     if (ret != AMEDIA_OK) {
+-        MP_ERR(mapper, "acquireLatestImage failed: %d\n", ret);
++        MP_ERR(mapper, "acquireNextImage failed: %d\n", ret);
+         // If we merely timed out waiting return success anyway to avoid
+         // flashing frames of render errors.
+         return image_available ? -1 : 0;
 PATCH
 fi
 
