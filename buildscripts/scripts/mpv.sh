@@ -146,6 +146,85 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
+# Keep the video frame already prepared by the VO across a normal pause. mpv
+# otherwise promotes that queued frame while paused, replacing the frame that
+# was visible when pause was requested. Holding it is the video equivalent of
+# pausing AudioTrack without flushing its queued audio: no seek, decoder reset,
+# or resume delay is needed.
+if ! grep -q 'hold_frame_queued' video/out/vo.c; then
+	patch -p1 --forward --batch <<'PATCH'
+diff --git a/video/out/vo.c b/video/out/vo.c
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -137,6 +137,8 @@ struct vo_internal {
+     bool want_redraw;               // redraw request from VO to player
+     bool send_reset;                // send VOCTRL_RESET
+     bool paused;
++    bool hold_frame_queued;         // keep the pre-pause frame for resume
++    int64_t pause_started;
+     bool visible;
+     bool wakeup_on_done;
+     int queued_events;              // event mask for the user
+@@ -702,6 +704,8 @@ static void forget_frames(struct vo *vo)
+     in->delayed_count = 0;
+     talloc_free(in->frame_queued);
+     in->frame_queued = NULL;
++    in->hold_frame_queued = false;
++    in->pause_started = 0;
+     in->current_frame_id += VO_MAX_REQ_FRAMES + 1;
+     // don't unref current_frame; we always want to be able to redraw it
+     if (in->current_frame) {
+@@ -895,7 +898,7 @@ void vo_wait_frame(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+     mp_mutex_lock(&in->lock);
+-    while (in->frame_queued || in->rendering)
++    while ((in->frame_queued && !in->hold_frame_queued) || in->rendering)
+         mp_cond_wait(&in->wakeup, &in->lock);
+     mp_mutex_unlock(&in->lock);
+ }
+@@ -926,3 +930,8 @@ static bool render_frame(struct vo *vo)
+     mp_mutex_lock(&in->lock);
+-
++    // A frame queued before pausing belongs immediately after the frame that
++    // is already visible. Keep it queued instead of advancing the paused
++    // picture. It will be rendered normally as soon as playback resumes.
++    if (in->paused && in->hold_frame_queued && in->frame_queued)
++        goto done;
++
+     if (in->frame_queued) {
+@@ -1229,6 +1238,28 @@ void vo_set_paused(struct vo *vo, bool paused)
+     struct vo_internal *in = vo->in;
+     mp_mutex_lock(&in->lock);
+     if (in->paused != paused) {
++        int64_t now = mp_time_ns();
++
++        if (paused) {
++            // Preserve only a frame that was already queued behind a frame
++            // which reached the display. Initial frames and frames produced
++            // by a seek while paused must still be allowed through.
++            in->hold_frame_queued = in->frame_queued && in->hasframe_rendered;
++            in->pause_started = in->hold_frame_queued ? now : 0;
++        } else if (in->hold_frame_queued) {
++            // The retained frame still carries its pre-pause wall-clock PTS.
++            // Move it by the pause duration so it is neither late nor dropped
++            // on resume, while preserving the remainder of the frame timing.
++            if (in->frame_queued && !in->frame_queued->display_synced) {
++                int64_t pause_duration = MPMAX(now - in->pause_started, 0);
++                in->frame_queued->pts += pause_duration;
++                if (in->wakeup_pts)
++                    in->wakeup_pts += pause_duration;
++            }
++            in->hold_frame_queued = false;
++            in->pause_started = 0;
++        }
++
+         in->paused = paused;
+         if (in->paused && in->dropped_frame) {
+             in->request_redraw = true;
+PATCH
+fi
+
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
 # their target and performs one seek to the closest result in the requested
