@@ -207,11 +207,13 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     /**
-     * Append one unescaped item to a file-local mpv list option. This is used from the on_load
-     * hook, where mpv explicitly allows file-local options to be prepared before opening media.
+     * Append one unescaped item to a file-local mpv list option. Action suffixes such as
+     * `audio-files-append` are command-line option operations, not writable property names. Use
+     * mpv's runtime list command against the file-local option instead, so existing list entries
+     * are preserved and paths containing separators (notably content:// URIs) need no escaping.
      */
     fun appendFileLocalListItem(name: String, value: String) {
-        MPVLib.setPropertyString("file-local-options/${name}-append", value)
+        MPVLib.command(arrayOf("change-list", "file-local-options/$name", "append", value))
     }
 
     fun setFileLocalInt(name: String, value: Int) {
