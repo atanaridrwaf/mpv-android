@@ -4123,8 +4123,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     private fun sendGestureScrubSeek(targetSec: Double): Boolean {
-        if (smoothSeekGesture)
+        if (shouldUseExactGestureSeek(targetSec)) {
+            if (!smoothSeekGesture)
+                Log.v(TAG, "using an exact backward seek to synchronize external audio")
             return sendScrubSeek(targetSec, exact = true)
+        }
 
         val direction = targetSec.compareTo(initialSeek.toDouble())
         if (direction == 0)
@@ -4392,7 +4395,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     private fun performGestureIdleSeek() {
         if (!gestureScrubActive) return
         val target = pendingGestureSeekSec ?: return
-        val exact = smoothSeekGesture
+        val exact = shouldUseExactGestureSeek(target)
         if (gestureTargetAlreadyResolved(target, exact)) return
         if (sendGestureScrubSeek(target))
             lastIssuedGestureSeekSec = target
@@ -4409,9 +4412,25 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     // Gesture handler
 
     private var initialSeek = 0f
+    // Snapshot this at gesture start. Querying it again while mpv is restarting playback can
+    // transiently return unavailable and would let a newer drag sample fall back to the broken
+    // keyframe-only path midway through the same gesture.
+    private var gestureExternalAudioSelected = false
     private var initialBright = 0f
     private var initialVolume = 0
     private var maxVolume = 0
+
+    private fun isExternalAudioSelected(): Boolean =
+        MPVLib.getPropertyBoolean("current-tracks/audio/external") == true
+
+    // On a backward keyframe seek, the main video demuxer can land on an earlier video keyframe
+    // while a separate audio demuxer lands near the requested timestamp. mpv then has no audio
+    // for that interval and correctly delays it. Decode forward to the requested timestamp only
+    // for this combination, without changing the user's keyframe-seek preference elsewhere.
+    private fun shouldUseExactGestureSeek(targetSec: Double): Boolean =
+        smoothSeekGesture ||
+                (gestureExternalAudioSelected &&
+                        targetSec < initialSeek.toDouble() - SCRUB_TARGET_COMPARE_EPSILON_SEC)
 
     // Keeps gesture seeking responsive after hitting either edge of the video.
     // Any drag distance beyond 0/duration is folded into this offset, so the
@@ -4450,6 +4469,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 refreshPlayerOverlay()
 
                 initialSeek = (psc.position / 1000f)
+                gestureExternalAudioSelected = isExternalAudioSelected()
                 initialBright = Utils.getScreenBrightness(this) ?: 0.5f
                 with (audioManager!!) {
                     initialVolume = getStreamVolume(STREAM_TYPE)
@@ -4520,7 +4540,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (previousTarget == null || !sameSeekTarget(previousTarget, newPos)) {
                     supersedeActiveScrubSeekIfTargetChanged(
                         newPos,
-                        exact = smoothSeekGesture
+                        exact = shouldUseExactGestureSeek(newPos)
                     )
                     scheduleGestureStableTargetSeek()
                 }
@@ -4554,7 +4574,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
                 val target = pendingGestureSeekSec
                 if (target != null &&
-                    !gestureTargetAlreadyResolved(target, exact = smoothSeekGesture)
+                    !gestureTargetAlreadyResolved(
+                        target,
+                        exact = shouldUseExactGestureSeek(target)
+                    )
                 ) {
                     if (sendGestureScrubSeek(target))
                         lastIssuedGestureSeekSec = target
@@ -4575,7 +4598,12 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
                 val seekTime = diff * 10f
                 val newPos = psc.positionSec + seekTime.toInt() // only for display
-                MPVLib.command(arrayOf("seek", seekTime.toString(), "relative"))
+                val seekMode = if (seekTime < 0f && isExternalAudioSelected()) {
+                    "relative+exact"
+                } else {
+                    "relative"
+                }
+                MPVLib.command(arrayOf("seek", seekTime.toString(), seekMode))
 
                 val diffText = Utils.prettyTime(seekTime.toInt(), true)
                 gestureTextView.text = getString(R.string.ui_seek_distance, Utils.prettyTime(newPos), diffText)
