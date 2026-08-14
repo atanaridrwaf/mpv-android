@@ -530,7 +530,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         player.addObserver(this)
         player.initialize(filesDir.path, cacheDir.path)
-        player.playFile(filepath)
+        player.playFile(filepath, persistedSubtitleLoadOptions(filepath))
 
         mediaSession = initMediaSession()
         updateMediaSession()
@@ -721,10 +721,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (!activityIsForeground && didResumeBackgroundPlayback) {
             if (this.newIntentReplace) {
-                MPVLib.command(arrayOf("loadfile", filepath, "replace"))
+                loadFileWithPersistedSubtitles(filepath, "replace")
                 showToast(getString(R.string.notice_file_play))
             } else {
-                MPVLib.command(arrayOf("loadfile", filepath, "append"))
+                loadFileWithPersistedSubtitles(filepath, "append")
                 showToast(getString(R.string.notice_file_appended))
             }
             moveTaskToBack(true)
@@ -732,7 +732,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Keep the current file visible while local metadata is probed. The orientation
             // request and loadfile command are then issued in the same UI-thread turn.
             runWithMediaOrientation(filepath) {
-                MPVLib.command(arrayOf("loadfile", filepath))
+                loadFileWithPersistedSubtitles(filepath)
             }
         }
     }
@@ -2027,6 +2027,60 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
 
+    /**
+     * Attach saved external subtitles to the playlist entry before mpv starts opening it. This
+     * makes the tracks available during mpv's initial stream selection, rather than adding them
+     * from FILE_LOADED after the first embedded-subtitle frame may already have been rendered.
+     */
+    private fun persistedSubtitleLoadOptions(mediaPath: String): String? {
+        if (!fileStatePersistenceEnabled())
+            return null
+
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        val externalFiles = linkedSetOf<String>()
+
+        fun addSavedExternal(kindKey: String, externalKey: String) {
+            val kind = prefs.getString(perFileKey(kindKey, mediaPath), null)
+            if (kind != PREF_SUB_KIND_EXTERNAL)
+                return
+            prefs.getString(perFileKey(externalKey, mediaPath), null)
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(externalFiles::add)
+        }
+
+        addSavedExternal(PREF_SUB_KIND, PREF_SUB_EXTERNAL)
+        addSavedExternal(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL)
+        if (externalFiles.isEmpty())
+            return null
+
+        // loadfile's fourth argument is a comma-separated key/value list. Fixed-length quoting
+        // keeps commas, colons and non-ASCII characters in Android paths unambiguous to mpv.
+        fun quotePath(path: String): String {
+            val utf8Length = path.toByteArray(Charsets.UTF_8).size
+            return "%${utf8Length}%$path"
+        }
+
+        if (externalFiles.size == 1)
+            return "sub-files-append=${quotePath(externalFiles.first())}"
+
+        // The outer quote belongs to loadfile's key/value parser; the inner quotes survive for
+        // sub-files-add's path-list parser. This preserves content URIs and filenames containing
+        // ':' or ',' even when both subtitle slots reference external files.
+        val pathList = externalFiles.joinToString(":", transform = ::quotePath)
+        return "sub-files-add=${quotePath(pathList)}"
+    }
+
+    private fun loadFileWithPersistedSubtitles(path: String, flags: String = "replace") {
+        val options = persistedSubtitleLoadOptions(path)
+        val command = if (options == null) {
+            arrayOf("loadfile", path, flags)
+        } else {
+            // Since mpv 0.38, -1 occupies loadfile's insertion-index argument.
+            arrayOf("loadfile", path, flags, "-1", options)
+        }
+        MPVLib.command(command)
+    }
+
     private fun fileStatePersistenceEnabled(): Boolean {
         return getDefaultSharedPreferences(applicationContext)
             .getBoolean("save_position", false)
@@ -2452,7 +2506,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
             openFilePickerFor(RCODE_LOAD_FILE, "", skip) { result, data ->
                 if (result == RESULT_OK) {
                     val path = data!!.getStringExtra("path")!!
-                    MPVLib.command(arrayOf("loadfile", path, "append"))
+                    loadFileWithPersistedSubtitles(path, "append")
                     impl.refresh()
                 }
             }
@@ -2472,7 +2526,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                 urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     val url = helper.text
                     if (url.isNotBlank()) {
-                        MPVLib.command(arrayOf("loadfile", url, "append"))
+                        loadFileWithPersistedSubtitles(url, "append")
                         impl.refresh()
                     }
                     // Keep dialog open.
