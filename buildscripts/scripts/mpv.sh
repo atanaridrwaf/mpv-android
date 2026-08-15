@@ -146,150 +146,105 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
-# Preserve MediaCodec frame order through Android's AImageReader.
-#
-# AImageReader_acquireLatestImage() explicitly discards every queued image except
-# the newest one. That is useful for camera-style real-time consumers, but it is
-# wrong for a media player whose scheduler has already selected the exact decoded
-# frame to present: frames queued around pause/resume can otherwise disappear
-# outside mpv's framedrop accounting. Consume the queue in FIFO order instead.
-# Keep acquireLatestImage only as recovery after a real 100 ms delivery timeout,
-# where dropping stale late buffers is preferable to permanently shifting the
-# MediaCodec-buffer <-> AImage association.
-python3 - <<'PY_AIMAGEREADER_FIFO'
+# Freeze the actually displayed VO frame when pause is requested. mpv normally
+# promotes frame_queued even after in->paused has become true; on Android's
+# MediaCodec -> AImageReader path that can release a future decoder buffer after
+# the pause request and leave a late image in the reader. On resume, the normal
+# acquireLatestImage() path may then discard that late image together with other
+# queued images. Keep only the frame that was already queued at the instant of
+# pausing, and render that preserved frame first on resume. Frames produced by a
+# seek while already paused remain renderable, so paused seeking/frame stepping
+# keep their normal behavior.
+python3 - <<'PY_PAUSE_FRAME'
 from pathlib import Path
 
-path = Path("video/out/hwdec/hwdec_aimagereader.c")
+path = Path("video/out/vo.c")
 src = path.read_text()
-marker = "mpv-android: preserve MediaCodec AImage FIFO order"
+marker = "pause_hold_frame_queued"
 if marker in src:
     raise SystemExit(0)
 
-def replace_once(old, new, what):
-    global src
+replacements = [
+    (
+        "    bool paused;\n    bool visible;",
+        "    bool paused;\n"
+        "    // Android/MediaCodec: preserve a frame that was already queued when\n"
+        "    // pause was requested instead of drawing it after the pause edge.\n"
+        "    bool pause_hold_frame_queued;\n"
+        "    bool visible;",
+        "vo_internal pause state",
+    ),
+    (
+        "    mp_mutex_lock(&in->lock);\n"
+        "    if (in->frame_queued) {\n"
+        "        talloc_free(in->current_frame);\n"
+        "        in->current_frame = in->frame_queued;\n"
+        "        in->frame_queued = NULL;\n"
+        "    } else if (in->paused || !in->current_frame || !in->hasframe ||",
+        "    bool held_pause_frame = false;\n"
+        "    mp_mutex_lock(&in->lock);\n"
+        "    if (in->frame_queued && !(in->paused && in->pause_hold_frame_queued)) {\n"
+        "        held_pause_frame = in->pause_hold_frame_queued;\n"
+        "        in->pause_hold_frame_queued = false;\n"
+        "        talloc_free(in->current_frame);\n"
+        "        in->current_frame = in->frame_queued;\n"
+        "        in->frame_queued = NULL;\n"
+        "    } else if (in->paused || !in->current_frame || !in->hasframe ||",
+        "render_frame queue promotion",
+    ),
+    (
+        "    // Always render when paused (it's typically the last frame for a while).\n"
+        "    in->dropped_frame &= !in->paused;\n"
+        "\n"
+        "    bool use_vsync = in->current_frame->display_synced && !in->paused;",
+        "    // Always render when paused (it's typically the last frame for a while).\n"
+        "    in->dropped_frame &= !in->paused;\n"
+        "    // The held frame is the first frame after a pause edge. Its old\n"
+        "    // wall-clock deadline expired while paused, but its media order did\n"
+        "    // not. Never discard it merely for being late after resume. This is\n"
+        "    // deliberately after all normal/display-sync drop decisions.\n"
+        "    if (held_pause_frame)\n"
+        "        in->dropped_frame = false;\n"
+        "\n"
+        "    bool use_vsync = in->current_frame->display_synced && !in->paused;",
+        "held-frame drop suppression",
+    ),
+    (
+        "    talloc_free(in->frame_queued);\n"
+        "    in->frame_queued = NULL;\n"
+        "    in->current_frame_id += VO_MAX_REQ_FRAMES + 1;",
+        "    talloc_free(in->frame_queued);\n"
+        "    in->frame_queued = NULL;\n"
+        "    in->pause_hold_frame_queued = false;\n"
+        "    in->current_frame_id += VO_MAX_REQ_FRAMES + 1;",
+        "forget_frames reset",
+    ),
+    (
+        "    if (in->paused != paused) {\n"
+        "        in->paused = paused;\n"
+        "        if (in->paused && in->dropped_frame) {",
+        "    if (in->paused != paused) {\n"
+        "        in->paused = paused;\n"
+        "        // A frame can already have been handed to the VO before the\n"
+        "        // pause command is processed. Keep the currently displayed\n"
+        "        // frame frozen and defer only that pre-pause queued frame until\n"
+        "        // resume. A later paused seek clears this flag via forget_frames.\n"
+        "        if (paused && in->frame_queued && in->current_frame &&\n"
+        "            in->hasframe_rendered)\n"
+        "            in->pause_hold_frame_queued = true;\n"
+        "        if (in->paused && in->dropped_frame) {",
+        "vo_set_paused hold",
+    ),
+]
+
+for old, new, label in replacements:
     count = src.count(old)
     if count != 1:
-        raise SystemExit(
-            f"mpv AImageReader FIFO patch failed: expected one {what}, found {count}"
-        )
+        raise SystemExit(f"mpv pause-frame patch failed at {label}: expected 1 match, got {count}")
     src = src.replace(old, new, 1)
 
-replace_once(
-    "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
-    "    media_status_t (*AImageReader_acquireNextImage)(AImageReader *, AImage **);\n"
-    "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
-    "AImageReader function pointer",
-)
-replace_once(
-    '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
-    '    { "AImageReader_acquireNextImage", offsetof(struct priv_owner, AImageReader_acquireNextImage) },\n'
-    '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
-    "AImageReader symbol entry",
-)
-replace_once(
-    "    bool image_available;\n",
-    "    uint64_t image_generation;\n"
-    "    bool recover_latest;\n",
-    "image availability state",
-)
-replace_once(
-    "    p->image_available = true;\n",
-    "    p->image_generation++;\n",
-    "image callback state update",
-)
-
-# Patch only the acquisition section inside mapper_map. Do not match the whole
-# function body: mpv master changes nearby whitespace/comments often.
-func_start = src.find("static int mapper_map(struct ra_hwdec_mapper *mapper)")
-func_end = src.find("\nconst struct ra_hwdec_driver ra_hwdec_aimagereader", func_start)
-if func_start < 0 or func_end < 0:
-    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map function not found")
-
-chunk = src[func_start:func_end]
-release_anchor = "        av_mediacodec_release_buffer(buffer, 1);\n    }\n"
-hwbuf_anchor = "    AHardwareBuffer *hwbuf = NULL;\n"
-release_pos = chunk.find(release_anchor)
-hwbuf_pos = chunk.find(hwbuf_anchor)
-if release_pos < 0 or hwbuf_pos < 0 or hwbuf_pos <= release_pos:
-    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map acquisition anchors not found")
-
-replace_start = release_pos + len(release_anchor)
-old_acquire = chunk[replace_start:hwbuf_pos]
-if "AImageReader_acquireLatestImage" not in old_acquire:
-    raise SystemExit("mpv AImageReader FIFO patch failed: unexpected mapper_map acquisition code")
-
-new_acquire = r'''    // mpv-android: preserve MediaCodec AImage FIFO order. The frame scheduler has
-    // already chosen mapper->src, so silently replacing it with a newer queued
-    // image here creates a visible time jump that --framedrop=no cannot prevent.
-    uint64_t generation;
-    mp_mutex_lock(&p->lock);
-    generation = p->image_generation;
-    mp_mutex_unlock(&p->lock);
-
-    bool timed_out = false;
-    media_status_t ret;
-    for (;;) {
-        // A previous timeout can leave its Surface buffer arriving late. Use
-        // acquireLatestImage exactly once to drain that exceptional stale queue
-        // and re-align AImage with the MediaCodec buffer selected by this map.
-        if (p->recover_latest)
-            ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-        else
-            ret = o->AImageReader_acquireNextImage(o->reader, &p->image);
-
-        if (ret == AMEDIA_OK) {
-            p->recover_latest = false;
-            break;
-        }
-        if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-            MP_ERR(mapper, "%s failed: %d\n",
-                   p->recover_latest ? "acquireLatestImage" : "acquireNextImage", ret);
-            return -1;
-        }
-
-        // The callback is only a wake-up hint. A generation counter avoids
-        // losing a notification if several decoded frames become available
-        // before this thread gets the lock.
-        mp_mutex_lock(&p->lock);
-        if (p->image_generation == generation) {
-            mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
-            if (p->image_generation == generation)
-                timed_out = true;
-        }
-        generation = p->image_generation;
-        mp_mutex_unlock(&p->lock);
-
-        if (timed_out) {
-            // Retry once after the wait to cover the boundary race where the
-            // buffer became acquirable just as the timed wait expired.
-            if (p->recover_latest)
-                ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-            else
-                ret = o->AImageReader_acquireNextImage(o->reader, &p->image);
-            if (ret == AMEDIA_OK) {
-                p->recover_latest = false;
-                break;
-            }
-            if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-                MP_ERR(mapper, "AImageReader acquire after timeout failed: %d\n", ret);
-                return -1;
-            }
-
-            MP_WARN(mapper, "Waiting for frame timed out!\n");
-            // Match upstream's no-flash behavior for this map. The late image
-            // must be drained on the next map so it cannot shift all following
-            // frame associations by one.
-            p->recover_latest = true;
-            return 0;
-        }
-    }
-    mp_assert(p->image);
-'''
-
-chunk = chunk[:replace_start] + new_acquire + chunk[hwbuf_pos:]
-src = src[:func_start] + chunk + src[func_end:]
 path.write_text(src)
-PY_AIMAGEREADER_FIFO
+PY_PAUSE_FRAME
 
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
