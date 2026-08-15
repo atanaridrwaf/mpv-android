@@ -146,30 +146,6 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
-# Apply the video pause fix as a real source patch. Keeping it separate makes
-# every touched mpv subsystem reviewable, and the explicit presence check makes
-# CI fail instead of silently producing an unpatched libmpv.
-mpv_pause_patch_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-mpv_pause_patch="$mpv_pause_patch_dir/mpv-seamless-video-pause.patch"
-if [ ! -r "$mpv_pause_patch" ]; then
-	echo >&2 "Required mpv pause patch is missing: $mpv_pause_patch"
-	exit 1
-fi
-if ! grep -Fq 'Seamless video pause v4: ordered VO barrier enabled' video/out/vo.c ||
-	! grep -Fq 'AImageReader_acquireNextImage' video/out/hwdec/hwdec_aimagereader.c ||
-	! grep -Fq 'VO_CAP_ORDERED_PAUSE' video/out/vo_gpu_next.c ||
-	! grep -Fq 'VO_CAP_ORDERED_PAUSE' video/out/vo_gpu.c ||
-	! grep -Fq 'Ordered Android VOs acknowledge' player/playloop.c; then
-	patch -p1 --forward --batch < "$mpv_pause_patch"
-fi
-
-# Do not let a partial/old native build pass unnoticed.
-grep -Fq 'Seamless video pause v4: ordered VO barrier enabled' video/out/vo.c
-grep -Fq 'AImageReader_acquireNextImage' video/out/hwdec/hwdec_aimagereader.c
-grep -Fq 'VO_CAP_ORDERED_PAUSE' video/out/vo_gpu_next.c
-grep -Fq 'VO_CAP_ORDERED_PAUSE' video/out/vo_gpu.c
-grep -Fq 'Ordered Android VOs acknowledge' player/playloop.c
-
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
 # their target and performs one seek to the closest result in the requested
