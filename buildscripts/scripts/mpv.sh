@@ -13,324 +13,214 @@ else
 	exit 255
 fi
 
-# AudioTrack.pause() preserves queued audio, while flush() deliberately discards
-# it. mpv's AudioTrack backend only exposes reset (pause + flush), so a normal
-# player pause loses the 75-150 ms already handed to Android. Teach the backend
-# to use its hardware pause path and retain the unwritten tail of a blocking
-# AudioTrack.write() if pause interrupts that call.
-if ! grep -Eq '^[[:space:]]*\.set_pause[[:space:]]*=[[:space:]]*set_pause,' \
-	audio/out/ao_audiotrack.c; then
-	patch -p1 --forward --batch <<'PATCH'
-diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
---- a/audio/out/ao_audiotrack.c
-+++ b/audio/out/ao_audiotrack.c
-@@ -21,6 +21,8 @@
-  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
-  */
- 
-+#include <string.h>
-+
- #include "ao.h"
- #include "internal.h"
- #include "common/msg.h"
-@@ -52,6 +54,7 @@ struct priv {
- 
-     void *chunk;
-     int chunksize;
-+    int pending_bytes;
-     jbyteArray bytearray;
-     jshortArray shortarray;
-     jfloatArray floatarray;
-@@ -579,14 +582,25 @@ static MP_THREAD_VOID ao_thread(void *arg)
-             state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
-         }
-         if (state == AudioTrack.PLAYSTATE_PLAYING) {
--            int read_samples = p->chunksize / ao->sstride;
--            int64_t ts = mp_time_ns();
--            ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
--            ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
--            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
--            int ret = AudioTrack_write(ao, samples * ao->sstride);
-+            int bytes = p->pending_bytes;
-+            if (!bytes) {
-+                int read_samples = p->chunksize / ao->sstride;
-+                int64_t ts = mp_time_ns();
-+                ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
-+                ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
-+                int samples = ao_read_data(ao, &p->chunk, read_samples, ts,
-+                                           NULL, false, false);
-+                bytes = samples * ao->sstride;
-+            }
-+
-+            int ret = AudioTrack_write(ao, bytes);
-             if (ret >= 0) {
-+                mp_assert(ret <= bytes);
-+                mp_assert(ret % ao->sstride == 0);
-                 p->written_frames += ret / ao->sstride;
-+                p->pending_bytes = bytes - ret;
-+                if (ret > 0 && p->pending_bytes > 0)
-+                    memmove(p->chunk, (char *)p->chunk + ret, p->pending_bytes);
-             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
-                 MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
-                 if (AudioTrack_Recreate(ao) < 0) {
-@@ -808,30 +822,54 @@ static void stop(struct ao *ao)
- 
-     JNIEnv *env = MP_JNI_GET_ENV(ao);
-     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
--    MP_JNI_EXCEPTION_LOG(ao);
-+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-+        return;
-+
-+    // AudioTrack.pause() interrupts a blocking write. Wait for that write to
-+    // return before flushing and discarding any unwritten tail retained by the
-+    // audio thread.
-+    mp_mutex_lock(&p->lock);
-     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
-     MP_JNI_EXCEPTION_LOG(ao);
- 
-+    p->pending_bytes = 0;
-     p->playhead_offset = 0;
-     p->reset_pending = true;
-     p->written_frames = 0;
-     p->timestamp_fetched = 0;
-     p->timestamp_set = false;
-+    mp_mutex_unlock(&p->lock);
- }
- 
--static void start(struct ao *ao)
-+static bool set_pause(struct ao *ao, bool paused)
- {
-     struct priv *p = ao->priv;
-     if (!p->audiotrack) {
--        MP_ERR(ao, "AudioTrack does not exist to start!\n");
--        return;
-+        MP_ERR(ao, "AudioTrack does not exist to %s!\n",
-+               paused ? "pause" : "resume");
-+        return false;
-     }
- 
-+    // Do not take p->lock here. The audio thread holds it while blocked in
-+    // AudioTrack.write(), and pause() is what interrupts that write.
-     JNIEnv *env = MP_JNI_GET_ENV(ao);
--    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
--    MP_JNI_EXCEPTION_LOG(ao);
-+    if (paused)
-+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
-+    else
-+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
- 
--    mp_cond_signal(&p->wakeup);
-+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-+        return false;
-+
-+    if (!paused)
-+        mp_cond_signal(&p->wakeup);
-+
-+    return true;
-+}
-+
-+static void start(struct ao *ao)
-+{
-+    set_pause(ao, false);
- }
- 
- #define OPT_BASE_STRUCT struct priv
-@@ -843,6 +881,7 @@ const struct ao_driver audio_out_audiotrack = {
-     .uninit    = uninit,
-     .reset     = stop,
-     .start     = start,
-+    .set_pause = set_pause,
-     .priv_size = sizeof(struct priv),
-     .priv_defaults = &(const OPT_BASE_STRUCT) {
-         .cfg_pcm_float = 1,
-PATCH
-fi
-
-# Preserve MediaCodec frame order through Android's AImageReader.
+# Samsung-style pause/resume for Android AudioTrack + mpv's video output clock.
 #
-# AImageReader_acquireLatestImage() explicitly discards every queued image except
-# the newest one. That is useful for camera-style real-time consumers, but it is
-# wrong for a media player whose scheduler has already selected the exact decoded
-# frame to present: frames queued around pause/resume can otherwise disappear
-# outside mpv's framedrop accounting. Consume the queue in FIFO order instead.
-# Keep acquireLatestImage only as recovery after a real 100 ms delivery timeout,
-# where dropping stale late buffers is preferable to permanently shifting the
-# MediaCodec-buffer <-> AImage association.
-python3 - <<'PY_AIMAGEREADER_FIFO'
+# Normal pause preserves queued audio/video and freezes their realtime deadlines.
+# Full resets (seek/reconfigure/EOF) still flush exactly as upstream expects.
+python3 - <<'PY_SAMSUNG_AUDIO_PAUSE'
 from pathlib import Path
 
-path = Path("video/out/hwdec/hwdec_aimagereader.c")
+path = Path("audio/out/ao_audiotrack.c")
 src = path.read_text()
-marker = "mpv-android: preserve MediaCodec AImage FIFO order"
-if marker in src:
-    raise SystemExit(0)
+marker = "mpv-android: Samsung-style AudioTrack pause/resume"
+if marker not in src:
+    def replace_once(old, new, what):
+        global src
+        count = src.count(old)
+        if count != 1:
+            raise SystemExit(f"mpv Samsung AudioTrack patch failed: expected one {what}, found {count}")
+        src = src.replace(old, new, 1)
 
-def replace_once(old, new, what):
-    global src
-    count = src.count(old)
-    if count != 1:
-        raise SystemExit(
-            f"mpv AImageReader FIFO patch failed: expected one {what}, found {count}"
-        )
-    src = src.replace(old, new, 1)
+    if "#include <string.h>\n" not in src:
+        replace_once('#include "ao.h"\n', '#include <string.h>\n\n#include "ao.h"\n', "ao.h include anchor")
 
-replace_once(
-    "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
-    "    media_status_t (*AImageReader_acquireNextImage)(AImageReader *, AImage **);\n"
-    "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
-    "AImageReader function pointer",
-)
-replace_once(
-    '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
-    '    { "AImageReader_acquireNextImage", offsetof(struct priv_owner, AImageReader_acquireNextImage) },\n'
-    '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
-    "AImageReader symbol entry",
-)
-replace_once(
-    "    bool image_available;\n",
-    "    uint64_t image_generation;\n"
-    "    bool recover_latest;\n",
-    "image availability state",
-)
-replace_once(
-    "    p->image_available = true;\n",
-    "    p->image_generation++;\n",
-    "image callback state update",
-)
+    replace_once(
+        "    void *chunk;\n    int chunksize;\n",
+        "    void *chunk;\n"
+        "    int chunksize;\n"
+        "    int pending_bytes; // mpv-android: Samsung-style AudioTrack pause/resume\n",
+        "AudioTrack chunk fields",
+    )
 
-# Patch only the acquisition section inside mapper_map. Do not match the whole
-# function body: mpv master changes nearby whitespace/comments often.
-func_start = src.find("static int mapper_map(struct ra_hwdec_mapper *mapper)")
-func_end = src.find("\nconst struct ra_hwdec_driver ra_hwdec_aimagereader", func_start)
-if func_start < 0 or func_end < 0:
-    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map function not found")
+    func_start = src.find("static MP_THREAD_VOID ao_thread(void *arg)")
+    func_end = src.find("\nstatic void uninit(struct ao *ao)", func_start)
+    if func_start < 0 or func_end < 0:
+        raise SystemExit("mpv Samsung AudioTrack patch failed: ao_thread not found")
+    chunk = src[func_start:func_end]
+    branch_start = chunk.find("        if (state == AudioTrack.PLAYSTATE_PLAYING) {")
+    wait_anchor = (
+        "        } else {\n"
+        "            mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));\n"
+        "        }\n"
+    )
+    branch_end = chunk.find(wait_anchor, branch_start)
+    if branch_start < 0 or branch_end < 0:
+        raise SystemExit("mpv Samsung AudioTrack patch failed: ao_thread PLAYING branch not found")
+    branch_end += len(wait_anchor)
+    new_branch = r'''        if (state == AudioTrack.PLAYSTATE_PLAYING) {
+            // pause() can interrupt a blocking write. Keep the unwritten tail
+            // and submit it first after resume instead of dropping samples.
+            int bytes = p->pending_bytes;
+            if (!bytes) {
+                int read_samples = p->chunksize / ao->sstride;
+                int64_t ts = mp_time_ns();
+                ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
+                ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+                int samples = ao_read_data(ao, &p->chunk, read_samples, ts,
+                                           NULL, false, false);
+                bytes = samples * ao->sstride;
+            }
 
-chunk = src[func_start:func_end]
-release_anchor = "        av_mediacodec_release_buffer(buffer, 1);\n    }\n"
-hwbuf_anchor = "    AHardwareBuffer *hwbuf = NULL;\n"
-release_pos = chunk.find(release_anchor)
-hwbuf_pos = chunk.find(hwbuf_anchor)
-if release_pos < 0 or hwbuf_pos < 0 or hwbuf_pos <= release_pos:
-    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map acquisition anchors not found")
+            int ret = AudioTrack_write(ao, bytes);
+            if (ret >= 0) {
+                mp_assert(ret <= bytes);
+                mp_assert(ret % ao->sstride == 0);
+                p->written_frames += ret / ao->sstride;
+                p->pending_bytes = bytes - ret;
+                if (ret > 0 && p->pending_bytes > 0)
+                    memmove(p->chunk, (char *)p->chunk + ret, p->pending_bytes);
+            } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
+                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
+                if (AudioTrack_Recreate(ao) < 0)
+                    MP_ERR(ao, "AudioTrack_Recreate failed\n");
+            } else {
+                MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
+            }
+        } else {
+            mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
+        }
+'''
+    chunk = chunk[:branch_start] + new_branch + chunk[branch_end:]
+    src = src[:func_start] + chunk + src[func_end:]
 
-replace_start = release_pos + len(release_anchor)
-old_acquire = chunk[replace_start:hwbuf_pos]
-if "AImageReader_acquireLatestImage" not in old_acquire:
-    raise SystemExit("mpv AImageReader FIFO patch failed: unexpected mapper_map acquisition code")
+    ctrl_start = src.find("static void stop(struct ao *ao)")
+    ctrl_end = src.find("\n#define OPT_BASE_STRUCT struct priv", ctrl_start)
+    if ctrl_start < 0 or ctrl_end < 0:
+        raise SystemExit("mpv Samsung AudioTrack patch failed: AudioTrack control functions not found")
 
-new_acquire = r'''    // mpv-android: preserve MediaCodec AImage FIFO order. The frame scheduler has
-    // already chosen mapper->src, so silently replacing it with a newer queued
-    // image here creates a visible time jump that --framedrop=no cannot prevent.
-    uint64_t generation;
+    new_ctrl = r'''static void invalidate_audio_timestamp(struct priv *p)
+{
+    // Never extrapolate a cached pre-pause AudioTimestamp over wall-clock time
+    // spent paused. The first post-resume clock read must be fresh.
+    p->timestamp_fetched = 0;
+    p->timestamp_set = false;
+    p->timestamp_stable = 0;
+}
+
+static void stop(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->audiotrack) {
+        MP_ERR(ao, "AudioTrack does not exist to stop!\n");
+        return;
+    }
+
+    // Real reset only: interrupt the writer, then flush queued audio.
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+        return;
+
     mp_mutex_lock(&p->lock);
-    generation = p->image_generation;
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+    MP_JNI_EXCEPTION_LOG(ao);
+    p->pending_bytes = 0;
+    p->playhead_offset = 0;
+    p->reset_pending = true;
+    p->written_frames = 0;
+    p->playhead_pos = 0;
+    invalidate_audio_timestamp(p);
     mp_mutex_unlock(&p->lock);
+}
 
-    bool timed_out = false;
-    media_status_t ret;
-    for (;;) {
-        // A previous timeout can leave its Surface buffer arriving late. Use
-        // acquireLatestImage exactly once to drain that exceptional stale queue
-        // and re-align AImage with the MediaCodec buffer selected by this map.
-        if (p->recover_latest)
-            ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-        else
-            ret = o->AImageReader_acquireNextImage(o->reader, &p->image);
+static bool set_pause(struct ao *ao, bool paused)
+{
+    struct priv *p = ao->priv;
+    if (!p->audiotrack) {
+        MP_ERR(ao, "AudioTrack does not exist to %s!\n", paused ? "pause" : "resume");
+        return false;
+    }
 
-        if (ret == AMEDIA_OK) {
-            p->recover_latest = false;
-            break;
-        }
-        if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-            MP_ERR(mapper, "%s failed: %d\n",
-                   p->recover_latest ? "acquireLatestImage" : "acquireNextImage", ret);
-            return -1;
-        }
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    if (paused) {
+        // pause() must happen before taking p->lock so it can interrupt a
+        // blocking AudioTrack.write() owned by the AO thread.
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+            return false;
 
-        // The callback is only a wake-up hint. A generation counter avoids
-        // losing a notification if several decoded frames become available
-        // before this thread gets the lock.
         mp_mutex_lock(&p->lock);
-        if (p->image_generation == generation) {
-            mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
-            if (p->image_generation == generation)
-                timed_out = true;
-        }
-        generation = p->image_generation;
+        invalidate_audio_timestamp(p);
+        int pending = p->pending_bytes;
+        mp_mutex_unlock(&p->lock);
+        MP_VERBOSE(ao, "pause: AudioTrack queue preserved, pending=%d bytes\n", pending);
+    } else {
+        mp_mutex_lock(&p->lock);
+        invalidate_audio_timestamp(p);
         mp_mutex_unlock(&p->lock);
 
-        if (timed_out) {
-            // Retry once after the wait to cover the boundary race where the
-            // buffer became acquirable just as the timed wait expired.
-            if (p->recover_latest)
-                ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-            else
-                ret = o->AImageReader_acquireNextImage(o->reader, &p->image);
-            if (ret == AMEDIA_OK) {
-                p->recover_latest = false;
-                break;
-            }
-            if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-                MP_ERR(mapper, "AImageReader acquire after timeout failed: %d\n", ret);
-                return -1;
-            }
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+            return false;
 
-            MP_WARN(mapper, "Waiting for frame timed out!\n");
-            // Match upstream's no-flash behavior for this map. The late image
-            // must be drained on the next map so it cannot shift all following
-            // frame associations by one.
-            p->recover_latest = true;
-            return 0;
-        }
+        mp_cond_signal(&p->wakeup);
+        MP_VERBOSE(ao, "resume: AudioTrack queue preserved; timestamp refreshed\n");
     }
-    mp_assert(p->image);
+    return true;
+}
+
+static void start(struct ao *ao)
+{
+    set_pause(ao, false);
+}
 '''
+    src = src[:ctrl_start] + new_ctrl + src[ctrl_end:]
 
-chunk = chunk[:replace_start] + new_acquire + chunk[hwbuf_pos:]
-src = src[:func_start] + chunk + src[func_end:]
-path.write_text(src)
-PY_AIMAGEREADER_FIFO
+    driver_start = src.find("const struct ao_driver audio_out_audiotrack = {")
+    driver_end = src.find("\n};", driver_start)
+    if driver_start < 0 or driver_end < 0:
+        raise SystemExit("mpv Samsung AudioTrack patch failed: driver table not found")
+    driver = src[driver_start:driver_end]
+    if ".set_pause" not in driver:
+        old = "    .start     = start,\n"
+        if old not in driver:
+            raise SystemExit("mpv Samsung AudioTrack patch failed: driver start entry not found")
+        driver = driver.replace(old, old + "    .set_pause = set_pause,\n", 1)
+        src = src[:driver_start] + driver + src[driver_end:]
 
-# Freeze the VO presentation clock across pause/resume.
-#
-# Audio-sync frames carry absolute monotonic presentation timestamps. The
-# monotonic clock keeps advancing while playback is paused, but mpv previously
-# reset only vsync estimation on pause/resume and left an already-current or
-# queued frame's absolute PTS untouched. On resume that frame therefore appears
-# late by exactly the pause duration and can be presented immediately (or
-# dropped), producing a visible jump/burst even when the decoder queue itself is
-# intact. Android's NuPlayer instead freezes its MediaClock while paused. Rebase
-# the VO timestamps by the pause duration so queued work keeps the same relative
-# deadline after resume.
-python3 - <<'PY_VO_PAUSE_CLOCK'
+    path.write_text(src)
+PY_SAMSUNG_AUDIO_PAUSE
+
+# Freeze absolute realtime deadlines for frames that were already part of the
+# running video timeline when pause began. New frames produced by a seek/scrub
+# while paused have newer frame IDs and are deliberately not rebased.
+python3 - <<'PY_SAMSUNG_VIDEO_PAUSE'
 from pathlib import Path
 
 path = Path("video/out/vo.c")
 src = path.read_text()
-marker = "mpv-android: freeze VO presentation clock across pause"
-if marker in src:
-    raise SystemExit(0)
-
-field_anchor = "    bool paused;\n    bool visible;\n"
-if src.count(field_anchor) != 1:
-    raise SystemExit(
-        f"mpv VO pause-clock patch failed: expected one paused field anchor, "
-        f"found {src.count(field_anchor)}"
+marker = "mpv-android: Samsung-style video clock freeze"
+if marker not in src:
+    field_anchor = "    bool paused;\n    bool visible;\n"
+    if src.count(field_anchor) != 1:
+        raise SystemExit(
+            f"mpv Samsung video-clock patch failed: expected one paused field anchor, found {src.count(field_anchor)}"
+        )
+    src = src.replace(
+        field_anchor,
+        "    bool paused;\n"
+        "    int64_t pause_started_ns; // mpv-android: Samsung-style video clock freeze\n"
+        "    uint64_t pause_frame_cutoff_id;\n"
+        "    bool visible;\n",
+        1,
     )
-src = src.replace(
-    field_anchor,
-    "    bool paused;\n"
-    "    int64_t pause_started_ns;        // mpv-android: freeze VO presentation clock across pause\n"
-    "    bool visible;\n",
-    1,
-)
 
-func_start = src.find("void vo_set_paused(struct vo *vo, bool paused)\n{")
-func_end = src.find("\nint64_t vo_get_drop_count(struct vo *vo)", func_start)
-if func_start < 0 or func_end < 0:
-    raise SystemExit("mpv VO pause-clock patch failed: vo_set_paused function not found")
+    func_start = src.find("void vo_set_paused(struct vo *vo, bool paused)\n{")
+    func_end = src.find("\nint64_t vo_get_drop_count(struct vo *vo)", func_start)
+    if func_start < 0 or func_end < 0:
+        raise SystemExit("mpv Samsung video-clock patch failed: vo_set_paused not found")
 
-new_func = r'''void vo_set_paused(struct vo *vo, bool paused)
+    new_func = r'''void vo_set_paused(struct vo *vo, bool paused)
 {
     struct vo_internal *in = vo->in;
     mp_mutex_lock(&in->lock);
@@ -338,25 +228,36 @@ new_func = r'''void vo_set_paused(struct vo *vo, bool paused)
         int64_t now = mp_time_ns();
 
         if (paused) {
-            // Remember the wall-clock point where the media clock stopped.
             in->pause_started_ns = now;
+            in->pause_frame_cutoff_id = in->current_frame_id;
         } else if (in->pause_started_ns > 0) {
             int64_t paused_for = now - in->pause_started_ns;
+            uint64_t cutoff = in->pause_frame_cutoff_id;
             in->pause_started_ns = 0;
+            in->pause_frame_cutoff_id = 0;
 
             if (paused_for > 0) {
-                // Non-display-sync frames use absolute monotonic PTS values.
-                // Shift only frames that use those timestamps; display-sync
-                // frames are driven by vsync counts and are reset below.
-                if (in->current_frame && !in->current_frame->display_synced)
+                bool shifted_current = in->current_frame &&
+                    in->current_frame->frame_id <= cutoff &&
+                    !in->current_frame->display_synced;
+                bool shifted_queued = in->frame_queued &&
+                    in->frame_queued->frame_id <= cutoff &&
+                    !in->frame_queued->display_synced;
+
+                if (shifted_current)
                     in->current_frame->pts += paused_for;
-                if (in->frame_queued && !in->frame_queued->display_synced)
+                if (shifted_queued)
                     in->frame_queued->pts += paused_for;
-                if (in->wakeup_pts > 0)
+
+                if (in->wakeup_pts > 0 && (shifted_queued ||
+                    (!in->frame_queued && shifted_current)))
                     in->wakeup_pts += paused_for;
 
-                MP_VERBOSE(vo, "resume: rebased queued video timing by %.3f ms\n",
-                           MP_TIME_NS_TO_S(paused_for) * 1000.0);
+                in->dropped_frame = false;
+                MP_VERBOSE(vo,
+                    "resume: video clock frozen for %.3f ms (current=%d queued=%d)\n",
+                    MP_TIME_NS_TO_S(paused_for) * 1000.0,
+                    shifted_current, shifted_queued);
             }
         }
 
@@ -371,10 +272,9 @@ new_func = r'''void vo_set_paused(struct vo *vo, bool paused)
     mp_mutex_unlock(&in->lock);
 }
 '''
-
-src = src[:func_start] + new_func + src[func_end:]
-path.write_text(src)
-PY_VO_PAUSE_CLOCK
+    src = src[:func_start] + new_func + src[func_end:]
+    path.write_text(src)
+PY_SAMSUNG_VIDEO_PAUSE
 
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
