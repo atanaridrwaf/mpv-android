@@ -144,6 +144,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // the user can change their mind while a slow exact seek is still completing.
     private var scrubPlaybackPaused: Boolean? = null
 
+    // Frame position captured when mpv actually enters pause.  A normal `cycle pause` resume can
+    // expose decoder/VO buffering on Android as a small forward jump, especially with hardware
+    // decoding.  Keep the exact paused frame timestamp and restore it while mpv is still paused
+    // before allowing playback to continue.
+    @Volatile
+    private var pausedFrameResumePositionSec: Double? = null
+
     private val scrubFrameGraceRunnable = Runnable { finishScrubSeekAfterFrameGrace() }
     private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
 
@@ -339,11 +346,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private var currentWatchLaterPath: String? = null
     private var completedWatchLaterPath: String? = null
 
-    // True only while restoring persisted subtitle selections for the current file. Track-list
-    // changes can complete external subtitle loading after START_FILE, so restoration is retried
-    // from the property callback rather than by sleeping/polling.
-    private var restoringPersistedSubtitleSelection = false
-
     private var autoRotationMode = ""
 
     private var controlsAtBottom = true
@@ -435,6 +437,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private var playbackHasStarted = false
     private var onloadCommands = mutableListOf<Array<String>>()
+    private var pendingSubtitleRestorePath: String? = null
+    private val externalSubtitleLoadsInFlight = mutableSetOf<String>()
 
     // Activity lifetime
 
@@ -535,7 +539,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         player.addObserver(this)
         player.initialize(filesDir.path, cacheDir.path)
-        player.playFile(filepath)
+        player.playFile(filepath, persistedSubtitleLoadOptions(filepath))
 
         mediaSession = initMediaSession()
         updateMediaSession()
@@ -726,10 +730,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         if (!activityIsForeground && didResumeBackgroundPlayback) {
             if (this.newIntentReplace) {
-                MPVLib.command(arrayOf("loadfile", filepath, "replace"))
+                loadFileWithPersistedSubtitles(filepath, "replace")
                 showToast(getString(R.string.notice_file_play))
             } else {
-                MPVLib.command(arrayOf("loadfile", filepath, "append"))
+                loadFileWithPersistedSubtitles(filepath, "append")
                 showToast(getString(R.string.notice_file_appended))
             }
             moveTaskToBack(true)
@@ -737,7 +741,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             // Keep the current file visible while local metadata is probed. The orientation
             // request and loadfile command are then issued in the same UI-thread turn.
             runWithMediaOrientation(filepath) {
-                MPVLib.command(arrayOf("loadfile", filepath))
+                loadFileWithPersistedSubtitles(filepath)
             }
         }
     }
@@ -1069,10 +1073,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 // loss can occur in addition to ducking, so remember the old callback
                 val oldRestore = audioFocusRestore
                 val wasPlayerPaused = player.paused ?: false
-                player.paused = true
+                setPlaybackPausedFrameExact(true)
                 audioFocusRestore = {
                     oldRestore()
-                    if (!wasPlayerPaused) player.paused = false
+                    if (!wasPlayerPaused) setPlaybackPausedFrameExact(false)
                 }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
@@ -1143,10 +1147,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Pause playback during UI dialogs
         val wasPlayerPaused = player.paused ?: true
-        player.paused = true
+        setPlaybackPausedFrameExact(true)
         return {
             if (!wasPlayerPaused)
-                player.paused = false
+                setPlaybackPausedFrameExact(false)
         }
     }
 
@@ -1700,10 +1704,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             KeyEvent.KEYCODE_INFO -> toggleControls()
             KeyEvent.KEYCODE_MENU -> openTopMenu()
             KeyEvent.KEYCODE_GUIDE -> openTopMenu()
-            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> player.cyclePause()
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> togglePlaybackPauseFromUi()
 
             // (overrides a default binding)
-            KeyEvent.KEYCODE_ENTER -> player.cyclePause()
+            KeyEvent.KEYCODE_ENTER -> togglePlaybackPauseFromUi()
 
             else -> unhandled++
         }
@@ -2032,6 +2036,110 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun perFileKey(suffix: String, path: String): String = "perfile_${suffix}_${sha1Hex(path)}"
 
+    /**
+     * Attach saved external subtitles to the playlist entry before mpv starts opening it. This
+     * makes the tracks available during mpv's initial stream selection, rather than adding them
+     * from FILE_LOADED after the first embedded-subtitle frame may already have been rendered.
+     * The saved primary/secondary choices must be part of the same loadfile options as well:
+     * setting secondary-sid from FILE_LOADED is asynchronous and can otherwise happen one frame
+     * after an explicitly loaded external subtitle was auto-selected as the primary subtitle.
+     */
+    private fun persistedSubtitleLoadOptions(mediaPath: String): String? {
+        if (!fileStatePersistenceEnabled())
+            return null
+
+        val prefs = getDefaultSharedPreferences(applicationContext)
+        class SavedSubtitle(
+            val kind: String?,
+            val external: String?,
+            val sid: Int?
+        )
+
+        fun readSavedSubtitle(kindKey: String, externalKey: String, sidKey: String): SavedSubtitle {
+            val sidPreference = perFileKey(sidKey, mediaPath)
+            return SavedSubtitle(
+                kind = prefs.getString(perFileKey(kindKey, mediaPath), null),
+                external = prefs.getString(perFileKey(externalKey, mediaPath), null)
+                    ?.takeIf { it.isNotEmpty() },
+                sid = if (prefs.contains(sidPreference))
+                    prefs.getInt(sidPreference, -1)
+                else
+                    null
+            )
+        }
+
+        val primary = readSavedSubtitle(PREF_SUB_KIND, PREF_SUB_EXTERNAL, PREF_SUB_SID)
+        val secondary = readSavedSubtitle(PREF_SUB2_KIND, PREF_SUB2_EXTERNAL, PREF_SUB2_SID)
+        val externalFiles = linkedSetOf<String>()
+        for (selection in listOf(primary, secondary)) {
+            if (selection.kind == PREF_SUB_KIND_EXTERNAL)
+                selection.external?.let(externalFiles::add)
+        }
+
+        val options = mutableListOf<String>()
+
+        // loadfile's fourth argument is a comma-separated key/value list. Fixed-length quoting
+        // keeps commas, colons and non-ASCII characters in Android paths unambiguous to mpv.
+        fun quoteOptionValue(value: String): String {
+            val utf8Length = value.toByteArray(Charsets.UTF_8).size
+            return "%${utf8Length}%$value"
+        }
+
+        if (externalFiles.size == 1) {
+            // -append takes one literal path, so only loadfile's outer key/value parser needs
+            // quoting. In particular, content:// and commas remain part of the filename.
+            options += "sub-files-append=${quoteOptionValue(externalFiles.first())}"
+        } else if (externalFiles.size > 1) {
+            // -add parses a Unix ':'-separated path list after loadfile has parsed its own
+            // comma-separated option list. Escape the inner list first, then quote that complete
+            // value so the backslashes survive the outer parser.
+            fun escapePathListItem(path: String): String = buildString(path.length) {
+                for (char in path) {
+                    if (char == '\\' || char == ':')
+                        append('\\')
+                    append(char)
+                }
+            }
+
+            val pathList = externalFiles.joinToString(":") { escapePathListItem(it) }
+            options += "sub-files-add=${quoteOptionValue(pathList)}"
+        }
+
+        fun initialTrackOption(selection: SavedSubtitle): String? {
+            return when (selection.kind) {
+                // Explicitly loaded subtitle files win mpv's automatic subtitle ranking. With
+                // both slots set to auto, mpv picks them in the primary/secondary load order.
+                PREF_SUB_KIND_EXTERNAL -> selection.external?.let { "auto" }
+                PREF_SUB_KIND_SID -> selection.sid?.let { if (it < 0) "no" else it.toString() }
+                else -> null
+            }
+        }
+
+        var primaryOption = initialTrackOption(primary)
+        val secondaryOption = initialTrackOption(secondary)
+        if (primaryOption == null && secondary.kind == PREF_SUB_KIND_EXTERNAL) {
+            // A legacy/incomplete snapshot may only contain the secondary external filename.
+            // Prevent mpv from auto-selecting that file into the primary slot before it chooses
+            // the same explicitly loaded track for secondary-sid=auto.
+            primaryOption = "no"
+        }
+        primaryOption?.let { options += "sid=$it" }
+        secondaryOption?.let { options += "secondary-sid=$it" }
+
+        return options.takeIf { it.isNotEmpty() }?.joinToString(",")
+    }
+
+    private fun loadFileWithPersistedSubtitles(path: String, flags: String = "replace") {
+        val options = persistedSubtitleLoadOptions(path)
+        val command = if (options == null) {
+            arrayOf("loadfile", path, flags)
+        } else {
+            // Since mpv 0.38, -1 occupies loadfile's insertion-index argument.
+            arrayOf("loadfile", path, flags, "-1", options)
+        }
+        MPVLib.command(command)
+    }
+
     private fun fileStatePersistenceEnabled(): Boolean {
         return getDefaultSharedPreferences(applicationContext)
             .getBoolean("save_position", false)
@@ -2059,8 +2167,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun rememberActiveTrackSelectionsForCurrentFile() {
         if (!fileStatePersistenceEnabled())
             return
-        rememberSubtitleSelectionForCurrentFile()
-        rememberSubtitleSelectionForCurrentFile(secondary = true)
+
+        // If a fallback sub-add is still in flight, keep the stored external filenames intact.
+        // The track-list callback will take the authoritative snapshot after restoration finishes.
+        val mediaPath = MPVLib.getPropertyString("path")
+        val subtitleRestorePending = pendingSubtitleRestorePath?.let { it == mediaPath } == true
+        if (!subtitleRestorePending) {
+            rememberSubtitleSelectionForCurrentFile()
+            rememberSubtitleSelectionForCurrentFile(secondary = true)
+        }
         rememberAudioSelectionForCurrentFile()
     }
 
@@ -2115,66 +2230,44 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    /**
-     * Prepare persisted subtitle slots before mpv performs automatic stream selection.
-     *
-     * We only suppress a slot that actually has a persisted choice. External subtitle files are
-     * queued here, while their numeric track IDs are resolved from track-list changes later. This
-     * is event-driven: there is no sleep/polling window and no need to write the restored choice
-     * back into preferences during file initialization.
-     */
-    private fun preparePersistedSubtitleSelectionForStartFile(): Boolean {
-        if (!fileStatePersistenceEnabled())
-            return false
-        val mediaPath = MPVLib.getPropertyString("path") ?: return false
-        val prefs = getDefaultSharedPreferences(applicationContext)
-
-        val kind1 = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null)
-        val ext1 = prefs.getString(perFileKey(PREF_SUB_EXTERNAL, mediaPath), null)
-        val kind2 = prefs.getString(perFileKey(PREF_SUB2_KIND, mediaPath), null)
-        val ext2 = prefs.getString(perFileKey(PREF_SUB2_EXTERNAL, mediaPath), null)
-
-        val hasPrimary = kind1 != null
-        val hasSecondary = kind2 != null
-        if (!hasPrimary && !hasSecondary)
-            return false
-
-        // Prevent mpv's normal/default subtitle from becoming visible in either persisted slot
-        // before we have resolved the user's saved choice. The slot is restored as soon as the
-        // corresponding track-list entry appears.
-        if (hasPrimary)
-            player.setFileLocalString("sid", "no")
-        if (hasSecondary)
-            player.setFileLocalString("secondary-sid", "no")
-
-        if (kind1 == PREF_SUB_KIND_EXTERNAL && !ext1.isNullOrEmpty())
-            MPVLib.command(arrayOf("sub-add", ext1, "select"))
-
-        // Add the secondary external subtitle independently. If it is the same file as the
-        // primary selection, the primary add already creates the track and the same track ID can
-        // be assigned to both slots later.
-        if (kind2 == PREF_SUB_KIND_EXTERNAL && !ext2.isNullOrEmpty() && ext2 != ext1)
-            MPVLib.command(arrayOf("sub-add", ext2, "auto"))
-
-        return true
+    private fun clearPendingSubtitleRestore() {
+        pendingSubtitleRestorePath = null
+        externalSubtitleLoadsInFlight.clear()
     }
 
-    /**
-     * Restore the persisted primary/secondary subtitle slots without changing the persisted
-     * preferences. Returns true only when every persisted external track needed for restoration
-     * is present in track-list. This lets callers retry on a track-list change without polling.
-     */
     private fun restoreSubtitleSelectionForCurrentFile(): Boolean {
-        if (!fileStatePersistenceEnabled())
+        if (!fileStatePersistenceEnabled()) {
+            clearPendingSubtitleRestore()
             return true
+        }
         val mediaPath = MPVLib.getPropertyString("path") ?: return false
         val prefs = getDefaultSharedPreferences(applicationContext)
+        var waitingForExternalTrack = false
 
         fun setSubProp(prop: String, id: Int) {
-            if (id == -1)
-                player.setFileLocalString(prop, "no")
-            else
-                player.setFileLocalInt(prop, id)
+            player.setFileLocalTrack(prop, id)
+        }
+
+        fun resolveSelection(kind: String?, external: String?, sid: Int?): Int? {
+            return when (kind) {
+                PREF_SUB_KIND_EXTERNAL -> {
+                    if (external.isNullOrEmpty()) {
+                        null
+                    } else {
+                        val id = findExternalSubSidForFilename(external)
+                        if (id == null) {
+                            waitingForExternalTrack = true
+                            // Never block mpv's event thread waiting for sub-add. A subsequent
+                            // track-list update retries resolution once the new track has an ID.
+                            if (externalSubtitleLoadsInFlight.add(external))
+                                MPVLib.command(arrayOf("sub-add", external, "auto"))
+                        }
+                        id
+                    }
+                }
+                PREF_SUB_KIND_SID -> sid
+                else -> null
+            }
         }
 
         val kind1 = prefs.getString(perFileKey(PREF_SUB_KIND, mediaPath), null)
@@ -2191,36 +2284,36 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         else
             null
 
-        fun resolveSelection(kind: String?, external: String?, sid: Int?): Pair<Boolean, Int?> {
-            return when (kind) {
-                null -> true to null
-                PREF_SUB_KIND_EXTERNAL -> {
-                    if (external.isNullOrEmpty())
-                        true to -1
-                    else {
-                        val id = findExternalSubSidForFilename(external)
-                        (id != null) to id
-                    }
-                }
-                PREF_SUB_KIND_SID -> (sid != null) to sid
-                else -> true to null
-            }
+        // Adding an external track can influence mpv's automatic primary selection. Resolve every
+        // stored file first, then set the two slots explicitly so their order cannot be swapped.
+        val resolvedPrimary = resolveSelection(kind1, ext1, sid1)
+        val resolvedSecondary = resolveSelection(kind2, ext2, sid2)
+        if (waitingForExternalTrack) {
+            pendingSubtitleRestorePath = mediaPath
+            return false
         }
 
-        // Resolve both slots before changing either one. This prevents the primary selection from
-        // changing mpv's automatic state while the secondary external file is still being added.
-        val (primaryReady, resolvedPrimary) = resolveSelection(kind1, ext1, sid1)
-        val (secondaryReady, resolvedSecondary) = resolveSelection(kind2, ext2, sid2)
-
-        if (!primaryReady || !secondaryReady)
-            return false
-
-        if (kind1 != null)
-            setSubProp("sid", resolvedPrimary ?: -1)
-        if (kind2 != null)
-            setSubProp("secondary-sid", resolvedSecondary ?: -1)
-
+        clearPendingSubtitleRestore()
+        resolvedPrimary?.let { setSubProp("sid", it) }
+        resolvedSecondary?.let { setSubProp("secondary-sid", it) }
         return true
+    }
+
+    private fun retryPendingSubtitleRestore() {
+        val expectedPath = pendingSubtitleRestorePath ?: return
+        if (MPVLib.getPropertyString("path") != expectedPath) {
+            clearPendingSubtitleRestore()
+            return
+        }
+
+        val restored = try {
+            restoreSubtitleSelectionForCurrentFile()
+        } catch (_: Throwable) {
+            false
+        }
+        if (restored) {
+            try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
+        }
     }
 
     private fun findExternalSubSidForFilename(filename: String): Int? {
@@ -2310,8 +2403,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             }
             PREF_AUD_KIND_SID -> {
                 if (aid != null) {
-                    if (aid == -1) player.setFileLocalString("aid", "no")
-                    else player.setFileLocalInt("aid", aid)
+                    player.setFileLocalTrack("aid", aid)
                 }
             }
         }
@@ -2498,7 +2590,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
             openFilePickerFor(RCODE_LOAD_FILE, "", skip) { result, data ->
                 if (result == RESULT_OK) {
                     val path = data!!.getStringExtra("path")!!
-                    MPVLib.command(arrayOf("loadfile", path, "append"))
+                    loadFileWithPersistedSubtitles(path, "append")
                     impl.refresh()
                 }
             }
@@ -2518,7 +2610,7 @@ private fun openPlaylistMenu(restore: StateRestoreCallback, onBack: (() -> Unit)
                 urlDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     val url = helper.text
                     if (url.isNotBlank()) {
-                        MPVLib.command(arrayOf("loadfile", url, "append"))
+                        loadFileWithPersistedSubtitles(url, "append")
                         impl.refresh()
                     }
                     // Keep dialog open.
@@ -2800,7 +2892,7 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             // Restoring state may (un)pause so do that first.
             restoreState()
             backgroundPlayMode = "always"
-            player.paused = false
+            setPlaybackPausedFrameExact(false)
             moveTaskToBack(true)
         },
         MenuItem(R.id.chapterBtn, dismiss = true) {
@@ -3646,10 +3738,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPause() {
-            player.paused = true
+            setPlaybackPausedFrameExact(true)
         }
         override fun onPlay() {
-            player.paused = false
+            setPlaybackPausedFrameExact(false)
         }
         override fun onSeekTo(pos: Long) {
             player.timePos = (pos / 1000.0)
@@ -3762,16 +3854,11 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     }
 
     override fun eventProperty(property: String) {
-        if (property == "track-list" && restoringPersistedSubtitleSelection) {
-            try {
-                if (restoreSubtitleSelectionForCurrentFile())
-                    restoringPersistedSubtitleSelection = false
-            } catch (_: Throwable) {}
-        }
-
         val metaUpdated = psc.update(property)
         if (metaUpdated)
             updateMediaSession()
+        if (property == "track-list")
+            retryPendingSubtitleRestore()
         if (property == "loop-file" || property == "loop-playlist") {
             mediaSession?.setRepeatMode(when (player.getRepeat()) {
                 2 -> PlaybackStateCompat.REPEAT_MODE_ONE
@@ -3795,6 +3882,14 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             // position there so the Android main thread never blocks on mpv_get_property.
             val playbackTime = if (!value) readScrubPlaybackTimeFromMpv() else null
             eventUiHandler.post { handleScrubSeeking(value, playbackTime) }
+        } else if (property == "pause") {
+            // Capture only after mpv confirms it is paused. Reading the position when the button
+            // is pressed is too early: frames already scheduled by the decoder/VO may still
+            // advance before the pause property actually takes effect.
+            pausedFrameResumePositionSec = if (value)
+                readScrubPlaybackTimeFromMpv()?.takeIf { it.isFinite() }
+            else
+                null
         }
 
         val metaUpdated = psc.update(property, value)
@@ -3925,10 +4020,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             player.configureFileStatePersistence(persistFileState)
 
             if (persistFileState) {
-                // Restore the chosen audio before any subtitle loading or synchronous preference
-                // writes. Resolving two external subtitles can take a few hundred milliseconds;
-                // doing that first lets mpv briefly start the embedded audio before audio-add
-                // selects the saved external track.
+                // Restore the chosen audio before playback options and subtitle selection.
                 try { restoreAudioSelectionForCurrentFile() } catch (_: Throwable) {}
 
                 // These app snapshots survive deletion of watch-later at natural EOF, so only
@@ -3938,15 +4030,18 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // migrates existing installs before that file is removed at natural EOF.
                 try { player.persistCurrentPlaybackOptions() } catch (_: Throwable) {}
 
-                // Restore both subtitle slots, but never snapshot them back into preferences during
-                // initialization. The current track list is transient at this point; writing it back
-                // here could overwrite a saved secondary external subtitle with -1 before its track
-                // has finished being added. Any unresolved external slot will be retried from the
-                // track-list property event.
-                try {
-                    if (restoreSubtitleSelectionForCurrentFile())
-                        restoringPersistedSubtitleSelection = false
-                } catch (_: Throwable) {}
+                // Track IDs and the external track list are authoritative only after FILE_LOADED.
+                // Restore both subtitle slots now so a previous file or mpv's automatic selection
+                // cannot swap primary and secondary while the new file is still being initialized.
+                val subtitleRestoreComplete = try {
+                    restoreSubtitleSelectionForCurrentFile()
+                } catch (_: Throwable) {
+                    false
+                }
+                if (subtitleRestoreComplete)
+                    try { rememberActiveTrackSelectionsForCurrentFile() } catch (_: Throwable) {}
+                else
+                    try { rememberAudioSelectionForCurrentFile() } catch (_: Throwable) {}
             } else {
                 // resume-playback was disabled before loading, so this removes any old state
                 // without first applying it to the current session.
@@ -3973,6 +4068,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (eventId == MpvEvent.MPV_EVENT_START_FILE) {
             currentWatchLaterPath = null
             completedWatchLaterPath = null
+            clearPendingSubtitleRestore()
 
             eventUiHandler.postAtFrontOfQueue {
                 mediaGeometryReadyForOrientation = false
@@ -3996,12 +4092,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 MPVLib.setPropertyDouble("video-pan-y", 0.0)
             } catch (_: Throwable) {
                 // ignore
-            }
-
-            restoringPersistedSubtitleSelection = try {
-                preparePersistedSubtitleSelectionForStartFile()
-            } catch (_: Throwable) {
-                false
             }
 
             val cmds = onloadCommands.toTypedArray()
@@ -4031,6 +4121,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         activeScrubSeek = null
         scrubSeekInFlight = false
         scrubPlaybackPaused = null
+        pausedFrameResumePositionSec = null
         if (desiredPlaybackPaused != null) {
             player.paused = desiredPlaybackPaused
             updatePlaybackStatus(desiredPlaybackPaused)
@@ -4064,26 +4155,91 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return
 
         val playbackPaused = scrubPlaybackPaused ?: return
+
+        // If an exact seek finished while the requested state is still paused, its settled
+        // playback-time is now the frame that a later resume must restore. This also handles a
+        // user seeking to a different frame while already paused.
+        if (playbackPaused) {
+            pausedFrameResumePositionSec = latestPlaybackTimeSec.takeIf { it.isFinite() }
+                ?: readScrubPlaybackTimeFromMpv()?.takeIf { it.isFinite() }
+        }
+
         scrubPlaybackPaused = null
         player.paused = playbackPaused
+        if (!playbackPaused)
+            pausedFrameResumePositionSec = null
         // Setting the same mpv value does not necessarily emit a property event.
         updatePlaybackStatus(playbackPaused)
     }
 
-    private fun togglePlaybackPauseFromUi() {
-        val playbackPaused = scrubPlaybackPaused
-        if (playbackPaused == null) {
-            player.cyclePause()
+    /**
+     * Change the user's playback state without letting Android's decoder/output buffering turn
+     * an unpause into a visible multi-frame jump.
+     *
+     * Pausing itself is left to mpv. Once the `pause=yes` property event arrives,
+     * [pausedFrameResumePositionSec] contains the timestamp of the frame mpv actually stopped on.
+     * To resume video, keep mpv physically paused, seek exactly back to that timestamp and let the
+     * existing scrub controller wait for PLAYBACK_RESTART + a newly rendered frame. Only then is
+     * `pause` cleared. Audio-only playback does not need the video-frame restore path.
+     */
+    private fun setPlaybackPausedFrameExact(paused: Boolean) {
+        val heldPlaybackPaused = scrubPlaybackPaused
+        if (heldPlaybackPaused != null) {
+            // A scrub/exact-resume seek is already decoding under a physical pause. Only change
+            // the state that should be applied after the newest authoritative frame arrives.
+            scrubPlaybackPaused = paused
+            player.paused = true
+            updatePlaybackStatus(paused)
             return
         }
 
-        // Record the user's desired post-seek state, but keep mpv physically paused until the
-        // newest exact seek has produced its frame. Decoding while playback runs makes heavy
-        // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
-        val newPlaybackPaused = !playbackPaused
-        scrubPlaybackPaused = newPlaybackPaused
+        if (paused) {
+            player.paused = true
+            updatePlaybackStatus(true)
+            return
+        }
+
+        val isActuallyPaused = player.paused ?: psc.pause
+        if (!isActuallyPaused) {
+            updatePlaybackStatus(false)
+            return
+        }
+
+        val targetSec = pausedFrameResumePositionSec
+            ?: readScrubPlaybackTimeFromMpv()?.takeIf { it.isFinite() }
+
+        // With no video frame to preserve (audio-only, not-yet-loaded, etc.) the ordinary unpause
+        // is the correct behavior.
+        if (player.vid == -1 || targetSec == null) {
+            pausedFrameResumePositionSec = null
+            player.paused = false
+            updatePlaybackStatus(false)
+            return
+        }
+
+        scrubPlaybackPaused = false
         player.paused = true
-        updatePlaybackStatus(newPlaybackPaused)
+        updatePlaybackStatus(false)
+
+        if (!queueScrubSeek(
+                targetSec = targetSec,
+                exact = true,
+                commandValueSec = targetSec,
+                commandMode = "absolute+exact"
+            )
+        ) {
+            // If mpv rejects the restore seek, do not leave the UI stuck in an artificial hold.
+            // This fallback preserves the old behavior for unusual/unseekable inputs.
+            scrubPlaybackPaused = null
+            pausedFrameResumePositionSec = null
+            player.paused = false
+            updatePlaybackStatus(false)
+        }
+    }
+
+    private fun togglePlaybackPauseFromUi() {
+        val playbackPaused = scrubPlaybackPaused ?: (player.paused ?: psc.pause)
+        setPlaybackPausedFrameExact(!playbackPaused)
     }
 
     private fun invalidateGestureStableTargetCheck() {
