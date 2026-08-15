@@ -144,13 +144,6 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // the user can change their mind while a slow exact seek is still completing.
     private var scrubPlaybackPaused: Boolean? = null
 
-    // Frame position captured when mpv actually enters pause.  A normal `cycle pause` resume can
-    // expose decoder/VO buffering on Android as a small forward jump, especially with hardware
-    // decoding.  Keep the exact paused frame timestamp and restore it while mpv is still paused
-    // before allowing playback to continue.
-    @Volatile
-    private var pausedFrameResumePositionSec: Double? = null
-
     private val scrubFrameGraceRunnable = Runnable { finishScrubSeekAfterFrameGrace() }
     private val scrubHardTimeoutRunnable = Runnable { finishScrubSeekAfterHardTimeout() }
 
@@ -1073,10 +1066,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 // loss can occur in addition to ducking, so remember the old callback
                 val oldRestore = audioFocusRestore
                 val wasPlayerPaused = player.paused ?: false
-                setPlaybackPausedFrameExact(true)
+                player.paused = true
                 audioFocusRestore = {
                     oldRestore()
-                    if (!wasPlayerPaused) setPlaybackPausedFrameExact(false)
+                    if (!wasPlayerPaused) player.paused = false
                 }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
@@ -1147,10 +1140,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Pause playback during UI dialogs
         val wasPlayerPaused = player.paused ?: true
-        setPlaybackPausedFrameExact(true)
+        player.paused = true
         return {
             if (!wasPlayerPaused)
-                setPlaybackPausedFrameExact(false)
+                player.paused = false
         }
     }
 
@@ -1704,10 +1697,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             KeyEvent.KEYCODE_INFO -> toggleControls()
             KeyEvent.KEYCODE_MENU -> openTopMenu()
             KeyEvent.KEYCODE_GUIDE -> openTopMenu()
-            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> player.cyclePause()
 
             // (overrides a default binding)
-            KeyEvent.KEYCODE_ENTER -> togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_ENTER -> player.cyclePause()
 
             else -> unhandled++
         }
@@ -2892,7 +2885,7 @@ private fun openTopMenu(existingRestoreState: StateRestoreCallback? = null) {
             // Restoring state may (un)pause so do that first.
             restoreState()
             backgroundPlayMode = "always"
-            setPlaybackPausedFrameExact(false)
+            player.paused = false
             moveTaskToBack(true)
         },
         MenuItem(R.id.chapterBtn, dismiss = true) {
@@ -3738,10 +3731,10 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPause() {
-            setPlaybackPausedFrameExact(true)
+            player.paused = true
         }
         override fun onPlay() {
-            setPlaybackPausedFrameExact(false)
+            player.paused = false
         }
         override fun onSeekTo(pos: Long) {
             player.timePos = (pos / 1000.0)
@@ -3882,14 +3875,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             // position there so the Android main thread never blocks on mpv_get_property.
             val playbackTime = if (!value) readScrubPlaybackTimeFromMpv() else null
             eventUiHandler.post { handleScrubSeeking(value, playbackTime) }
-        } else if (property == "pause") {
-            // Capture only after mpv confirms it is paused. Reading the position when the button
-            // is pressed is too early: frames already scheduled by the decoder/VO may still
-            // advance before the pause property actually takes effect.
-            pausedFrameResumePositionSec = if (value)
-                readScrubPlaybackTimeFromMpv()?.takeIf { it.isFinite() }
-            else
-                null
         }
 
         val metaUpdated = psc.update(property, value)
@@ -4121,7 +4106,6 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         activeScrubSeek = null
         scrubSeekInFlight = false
         scrubPlaybackPaused = null
-        pausedFrameResumePositionSec = null
         if (desiredPlaybackPaused != null) {
             player.paused = desiredPlaybackPaused
             updatePlaybackStatus(desiredPlaybackPaused)
@@ -4155,91 +4139,26 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
             return
 
         val playbackPaused = scrubPlaybackPaused ?: return
-
-        // If an exact seek finished while the requested state is still paused, its settled
-        // playback-time is now the frame that a later resume must restore. This also handles a
-        // user seeking to a different frame while already paused.
-        if (playbackPaused) {
-            pausedFrameResumePositionSec = latestPlaybackTimeSec.takeIf { it.isFinite() }
-                ?: readScrubPlaybackTimeFromMpv()?.takeIf { it.isFinite() }
-        }
-
         scrubPlaybackPaused = null
         player.paused = playbackPaused
-        if (!playbackPaused)
-            pausedFrameResumePositionSec = null
         // Setting the same mpv value does not necessarily emit a property event.
         updatePlaybackStatus(playbackPaused)
     }
 
-    /**
-     * Change the user's playback state without letting Android's decoder/output buffering turn
-     * an unpause into a visible multi-frame jump.
-     *
-     * Pausing itself is left to mpv. Once the `pause=yes` property event arrives,
-     * [pausedFrameResumePositionSec] contains the timestamp of the frame mpv actually stopped on.
-     * To resume video, keep mpv physically paused, seek exactly back to that timestamp and let the
-     * existing scrub controller wait for PLAYBACK_RESTART + a newly rendered frame. Only then is
-     * `pause` cleared. Audio-only playback does not need the video-frame restore path.
-     */
-    private fun setPlaybackPausedFrameExact(paused: Boolean) {
-        val heldPlaybackPaused = scrubPlaybackPaused
-        if (heldPlaybackPaused != null) {
-            // A scrub/exact-resume seek is already decoding under a physical pause. Only change
-            // the state that should be applied after the newest authoritative frame arrives.
-            scrubPlaybackPaused = paused
-            player.paused = true
-            updatePlaybackStatus(paused)
-            return
-        }
-
-        if (paused) {
-            player.paused = true
-            updatePlaybackStatus(true)
-            return
-        }
-
-        val isActuallyPaused = player.paused ?: psc.pause
-        if (!isActuallyPaused) {
-            updatePlaybackStatus(false)
-            return
-        }
-
-        val targetSec = pausedFrameResumePositionSec
-            ?: readScrubPlaybackTimeFromMpv()?.takeIf { it.isFinite() }
-
-        // With no video frame to preserve (audio-only, not-yet-loaded, etc.) the ordinary unpause
-        // is the correct behavior.
-        if (player.vid == -1 || targetSec == null) {
-            pausedFrameResumePositionSec = null
-            player.paused = false
-            updatePlaybackStatus(false)
-            return
-        }
-
-        scrubPlaybackPaused = false
-        player.paused = true
-        updatePlaybackStatus(false)
-
-        if (!queueScrubSeek(
-                targetSec = targetSec,
-                exact = true,
-                commandValueSec = targetSec,
-                commandMode = "absolute+exact"
-            )
-        ) {
-            // If mpv rejects the restore seek, do not leave the UI stuck in an artificial hold.
-            // This fallback preserves the old behavior for unusual/unseekable inputs.
-            scrubPlaybackPaused = null
-            pausedFrameResumePositionSec = null
-            player.paused = false
-            updatePlaybackStatus(false)
-        }
-    }
-
     private fun togglePlaybackPauseFromUi() {
-        val playbackPaused = scrubPlaybackPaused ?: (player.paused ?: psc.pause)
-        setPlaybackPausedFrameExact(!playbackPaused)
+        val playbackPaused = scrubPlaybackPaused
+        if (playbackPaused == null) {
+            player.cyclePause()
+            return
+        }
+
+        // Record the user's desired post-seek state, but keep mpv physically paused until the
+        // newest exact seek has produced its frame. Decoding while playback runs makes heavy
+        // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
+        val newPlaybackPaused = !playbackPaused
+        scrubPlaybackPaused = newPlaybackPaused
+        player.paused = true
+        updatePlaybackStatus(newPlaybackPaused)
     }
 
     private fun invalidateGestureStableTargetCheck() {
