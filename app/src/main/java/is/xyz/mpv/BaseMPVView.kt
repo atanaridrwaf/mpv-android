@@ -67,17 +67,32 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
     protected abstract fun observeProperties()
 
-    private var filePath: String? = null
+    private data class PendingFile(
+        val path: String,
+        val options: String?,
+    )
+
+    private var pendingFile: PendingFile? = null
+
+    private fun loadFile(path: String, options: String?) {
+        val command = if (options.isNullOrEmpty()) {
+            arrayOf("loadfile", path)
+        } else {
+            // mpv >= 0.38 expects an insertion index before loadfile's per-file options.
+            arrayOf("loadfile", path, "replace", "-1", options)
+        }
+        MPVLib.command(command)
+    }
 
     /**
      * Set the first file to be played once the player is ready.
      */
-    fun playFile(filePath: String) {
+    fun playFile(filePath: String, options: String? = null) {
         if (attachedSurface != null) {
-            MPVLib.command(arrayOf("loadfile", filePath))
-            this.filePath = null
+            loadFile(filePath, options)
+            pendingFile = null
         } else {
-            this.filePath = filePath
+            pendingFile = PendingFile(filePath, options)
         }
     }
 
@@ -169,9 +184,10 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
         // This forces mpv to render subs/osd/whatever into our surface even if it would ordinarily not
         MPVLib.setOptionString("force-window", "yes")
 
-        if (filePath != null) {
-            MPVLib.command(arrayOf("loadfile", filePath as String))
-            filePath = null
+        val file = pendingFile
+        if (file != null) {
+            loadFile(file.path, file.options)
+            pendingFile = null
         } else {
             // We disable video output when the context disappears, enable it back
             MPVLib.setPropertyString("vo", voInUse)
