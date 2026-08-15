@@ -154,14 +154,25 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             }
 
             // Saving is all-or-nothing for this app: position and every app-controlled per-file
-            // option are stored together while the preference is enabled. Track IDs are kept
-            // out of watch-later because MPVActivity persists them together with external
-            // filenames; restoring an external ID before its file is added leaves mpv with a
-            // stale option value and an embedded track selected.
+            // option are stored together while the preference is enabled.
+            //
+            // aid/sid/secondary-sid are deliberately excluded here (unlike the full
+            // PER_FILE_PLAYBACK_OPTIONS list used for reset-on-next-file above). Those three are
+            // restored by MPVActivity instead, because external tracks need their filename
+            // resolved, not just a raw numeric id. If mpv's own watch-later mechanism also
+            // restores them natively, it does so earlier and blind to filenames: at that point
+            // an external track from a previous session doesn't exist yet, so mpv falls back to
+            // selecting the track list's default (typically an embedded track) and commits to it.
+            // MPVActivity's own restore then re-adds the external file and sets sid/secondary-sid
+            // to the same numeric id mpv's option already silently holds from that native
+            // restore, so mpv sees no value change and never re-applies the selection - leaving
+            // the embedded default active even though the external track is still listed. Letting
+            // MPVActivity own this exclusively (as it already does for SharedPreferences-based
+            // persistence via APP_PERSISTED_PLAYBACK_OPTIONS) avoids the conflict entirely.
             mergeStringListProperty(
                 "watch-later-options",
-                WATCH_LATER_PLAYBACK_OPTIONS + "start",
-                remove = APP_MANAGED_TRACK_OPTIONS
+                APP_PERSISTED_PLAYBACK_OPTIONS + "start",
+                remove = setOf("aid", "sid", "secondary-sid")
             )
         } else {
             if (!watchLaterOptionsSuppressed) {
@@ -212,26 +223,6 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     fun setFileLocalDouble(name: String, value: Double) {
         MPVLib.setPropertyDouble("file-local-options/$name", value)
-    }
-
-    /**
-     * Select a track for the current file even if watch-later left its unavailable ID in the
-     * underlying option. In that state mpv reports the effective embedded track, but assigning the
-     * same stale option again is a no-op. Synchronize the file-local option with the effective
-     * selection first so a subsequently added external track can be selected in one tap.
-     */
-    fun setFileLocalTrack(name: String, value: Int) {
-        require(name in TRACK_SELECTION_OPTIONS)
-
-        val target = if (value == -1) "no" else value.toString()
-        val effective = MPVLib.getPropertyString(name)
-        if (effective != target)
-            setFileLocalString(name, effective ?: "no")
-
-        if (value == -1)
-            setFileLocalString(name, "no")
-        else
-            setFileLocalInt(name, value)
     }
 
     fun persistCurrentFileState() {
@@ -591,7 +582,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             return v?.toIntOrNull() ?: -1
         }
         operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) {
-            setFileLocalTrack(name, value)
+            if (value == -1)
+                setFileLocalString(name, "no")
+            else
+                setFileLocalInt(name, value)
         }
     }
 
@@ -670,13 +664,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     companion object {
         private const val TAG = "mpv"
 
-        // MPVActivity stores these IDs separately so external filenames can be restored before
-        // selecting the corresponding dynamically assigned track ID.
-        private val APP_MANAGED_TRACK_OPTIONS = setOf("aid", "sid", "secondary-sid")
-        private val TRACK_SELECTION_OPTIONS = APP_MANAGED_TRACK_OPTIONS + "vid"
-
-        // Options controlled per media item by the Android UI. All are reset between playlist
-        // entries; the app-managed audio/subtitle IDs are excluded from watch-later below.
+        // Options controlled per media item by the Android UI. These are both reset between
+        // playlist entries and included in watch-later persistence.
         private val PER_FILE_PLAYBACK_OPTIONS = linkedSetOf(
             "speed",
             "audio-delay",
@@ -695,12 +684,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             "vid",
         )
 
-        private val WATCH_LATER_PLAYBACK_OPTIONS =
-            PER_FILE_PLAYBACK_OPTIONS - APP_MANAGED_TRACK_OPTIONS
-
         // Audio/subtitle IDs are restored together with external filenames by MPVActivity.
         private val APP_PERSISTED_PLAYBACK_OPTIONS =
-            PER_FILE_PLAYBACK_OPTIONS - APP_MANAGED_TRACK_OPTIONS
+            PER_FILE_PLAYBACK_OPTIONS - setOf("aid", "sid", "secondary-sid")
 
         // mpv option `hwdec` is set to this
         private const val HWDECS = "mediacodec,mediacodec-copy"
