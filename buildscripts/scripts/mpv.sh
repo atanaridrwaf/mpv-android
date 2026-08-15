@@ -13,235 +13,197 @@ else
 	exit 255
 fi
 
-# Samsung-style pause/resume for Android AudioTrack + gpu-next video queue.
-#
-# Normal pause preserves queued audio/video and freezes their realtime deadlines.
-# Full resets (seek/reconfigure/EOF) still flush exactly as upstream expects.
-python3 - <<'PY_SAMSUNG_AUDIO_PAUSE'
-from pathlib import Path
-
-path = Path("audio/out/ao_audiotrack.c")
-src = path.read_text()
-marker = "mpv-android: Samsung-style AudioTrack pause/resume"
-if marker not in src:
-    def replace_once(old, new, what):
-        global src
-        count = src.count(old)
-        if count != 1:
-            raise SystemExit(f"mpv Samsung AudioTrack patch failed: expected one {what}, found {count}")
-        src = src.replace(old, new, 1)
-
-    if "#include <string.h>\n" not in src:
-        replace_once('#include "ao.h"\n', '#include <string.h>\n\n#include "ao.h"\n', "ao.h include anchor")
-
-    replace_once(
-        "    void *chunk;\n    int chunksize;\n",
-        "    void *chunk;\n"
-        "    int chunksize;\n"
-        "    int pending_bytes; // mpv-android: Samsung-style AudioTrack pause/resume\n",
-        "AudioTrack chunk fields",
-    )
-
-    func_start = src.find("static MP_THREAD_VOID ao_thread(void *arg)")
-    func_end = src.find("\nstatic void uninit(struct ao *ao)", func_start)
-    if func_start < 0 or func_end < 0:
-        raise SystemExit("mpv Samsung AudioTrack patch failed: ao_thread not found")
-    chunk = src[func_start:func_end]
-    branch_start = chunk.find("        if (state == AudioTrack.PLAYSTATE_PLAYING) {")
-    wait_anchor = (
-        "        } else {\n"
-        "            mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));\n"
-        "        }\n"
-    )
-    branch_end = chunk.find(wait_anchor, branch_start)
-    if branch_start < 0 or branch_end < 0:
-        raise SystemExit("mpv Samsung AudioTrack patch failed: ao_thread PLAYING branch not found")
-    branch_end += len(wait_anchor)
-    new_branch = r'''        if (state == AudioTrack.PLAYSTATE_PLAYING) {
-            // pause() can interrupt a blocking write. Keep the unwritten tail
-            // and submit it first after resume instead of dropping samples.
-            int bytes = p->pending_bytes;
-            if (!bytes) {
-                int read_samples = p->chunksize / ao->sstride;
-                int64_t ts = mp_time_ns();
-                ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
-                ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
-                int samples = ao_read_data(ao, &p->chunk, read_samples, ts,
-                                           NULL, false, false);
-                bytes = samples * ao->sstride;
-            }
-
-            int ret = AudioTrack_write(ao, bytes);
-            if (ret >= 0) {
-                mp_assert(ret <= bytes);
-                mp_assert(ret % ao->sstride == 0);
-                p->written_frames += ret / ao->sstride;
-                p->pending_bytes = bytes - ret;
-                if (ret > 0 && p->pending_bytes > 0)
-                    memmove(p->chunk, (char *)p->chunk + ret, p->pending_bytes);
-            } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
-                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
-                if (AudioTrack_Recreate(ao) < 0)
-                    MP_ERR(ao, "AudioTrack_Recreate failed\n");
-            } else {
-                MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
-            }
-        } else {
-            mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
-        }
-'''
-    chunk = chunk[:branch_start] + new_branch + chunk[branch_end:]
-    src = src[:func_start] + chunk + src[func_end:]
-
-    ctrl_start = src.find("static void stop(struct ao *ao)")
-    ctrl_end = src.find("\n#define OPT_BASE_STRUCT struct priv", ctrl_start)
-    if ctrl_start < 0 or ctrl_end < 0:
-        raise SystemExit("mpv Samsung AudioTrack patch failed: AudioTrack control functions not found")
-
-    new_ctrl = r'''static void invalidate_audio_timestamp(struct priv *p)
-{
-    // Never extrapolate a cached pre-pause AudioTimestamp over wall-clock time
-    // spent paused. The first post-resume clock read must be fresh.
-    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    p->timestamp_stable = 0;
-}
-
-static void stop(struct ao *ao)
-{
-    struct priv *p = ao->priv;
-    if (!p->audiotrack) {
-        MP_ERR(ao, "AudioTrack does not exist to stop!\n");
-        return;
-    }
-
-    // Real reset only: interrupt the writer, then flush queued audio.
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
-    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-        return;
-
-    mp_mutex_lock(&p->lock);
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
-    MP_JNI_EXCEPTION_LOG(ao);
-    p->pending_bytes = 0;
-    p->playhead_offset = 0;
-    p->reset_pending = true;
-    p->written_frames = 0;
-    p->playhead_pos = 0;
-    invalidate_audio_timestamp(p);
-    mp_mutex_unlock(&p->lock);
-}
-
-static bool set_pause(struct ao *ao, bool paused)
-{
-    struct priv *p = ao->priv;
-    if (!p->audiotrack) {
-        MP_ERR(ao, "AudioTrack does not exist to %s!\n", paused ? "pause" : "resume");
-        return false;
-    }
-
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-    if (paused) {
-        // pause() must happen before taking p->lock so it can interrupt a
-        // blocking AudioTrack.write() owned by the AO thread.
-        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
-        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-            return false;
-
-        mp_mutex_lock(&p->lock);
-        invalidate_audio_timestamp(p);
-        int pending = p->pending_bytes;
-        mp_mutex_unlock(&p->lock);
-        MP_VERBOSE(ao, "pause: AudioTrack queue preserved, pending=%d bytes\n", pending);
-    } else {
-        mp_mutex_lock(&p->lock);
-        invalidate_audio_timestamp(p);
-        mp_mutex_unlock(&p->lock);
-
-        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
-        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-            return false;
-
-        mp_cond_signal(&p->wakeup);
-        MP_VERBOSE(ao, "resume: AudioTrack queue preserved; timestamp refreshed\n");
-    }
-    return true;
-}
-
-static void start(struct ao *ao)
-{
-    set_pause(ao, false);
-}
-'''
-    src = src[:ctrl_start] + new_ctrl + src[ctrl_end:]
-
-    driver_start = src.find("const struct ao_driver audio_out_audiotrack = {")
-    driver_end = src.find("\n};", driver_start)
-    if driver_start < 0 or driver_end < 0:
-        raise SystemExit("mpv Samsung AudioTrack patch failed: driver table not found")
-    driver = src[driver_start:driver_end]
-    if ".set_pause" not in driver:
-        old = "    .start     = start,\n"
-        if old not in driver:
-            raise SystemExit("mpv Samsung AudioTrack patch failed: driver start entry not found")
-        driver = driver.replace(old, old + "    .set_pause = set_pause,\n", 1)
-        src = src[:driver_start] + driver + src[driver_end:]
-
-    path.write_text(src)
-PY_SAMSUNG_AUDIO_PAUSE
-
-# Reset gpu-next/libplacebo's private frame queue on user pause.
-#
-# The generic VO queue can contain only the retained current frame while gpu-next
-# still owns a separate pl_queue of interpolation/reference frames. Keeping that
-# private queue across pause/resume lets its virtual presentation timeline remain
-# ahead of the frame visibly retained during pause. Reset it on the paused redraw
-# so the retained frame becomes the new queue anchor, while leaving interpolation
-# and normal framedrop policy untouched.
-python3 - <<'PY_GPU_NEXT_PAUSE_QUEUE'
-from pathlib import Path
-
-path = Path("video/out/vo_gpu_next.c")
-src = path.read_text()
-marker = "mpv-android: reset libplacebo queue on pause"
-if marker not in src:
-    old = '''    case VOCTRL_PAUSE:
-        if (p->is_interpolated)
-            vo->want_redraw = true;
-        p->paused = true;
-        return VO_TRUE;
-    case VOCTRL_RESUME:
-        p->paused = false;
-        return VO_TRUE;
-'''
-    new = '''    case VOCTRL_PAUSE:
-        // mpv-android: reset libplacebo queue on pause.
-        //
-        // gpu-next has its own pl_queue in addition to mpv's generic VO queue.
-        // In particular, interpolation can leave future/reference frames in
-        // that queue even when the generic VO reports only one retained frame.
-        // Reset on the redraw performed while paused: draw_frame() then runs
-        // with the mixer disabled, clears pl_queue/renderer cache through the
-        // existing want_reset path, and re-anchors it to the retained frame.
-        p->paused = true;
-        p->want_reset = true;
-        vo->want_redraw = true;
-        MP_VERBOSE(vo, "pause: scheduling libplacebo queue reset at retained frame\\n");
-        return VO_TRUE;
-    case VOCTRL_RESUME:
-        p->paused = false;
-        MP_VERBOSE(vo, "resume: libplacebo queue anchored to paused frame\\n");
-        return VO_TRUE;
-'''
-    count = src.count(old)
-    if count != 1:
-        raise SystemExit(
-            f"mpv gpu-next pause-queue patch failed: expected one VOCTRL_PAUSE/RESUME block, found {count}"
-        )
-    src = src.replace(old, new, 1)
-    path.write_text(src)
-PY_GPU_NEXT_PAUSE_QUEUE
+# AudioTrack.pause() preserves queued audio, while flush() deliberately discards
+# it. mpv's AudioTrack backend only exposes reset (pause + flush), so a normal
+# player pause loses the 75-150 ms already handed to Android. Teach the backend
+# to use its hardware pause path and retain the unwritten tail of a blocking
+# AudioTrack.write() if pause interrupts that call. Also invalidate/rebase the
+# cached AudioTimestamp around hardware pause: otherwise a pre-pause timestamp
+# can be extrapolated across the paused wall-clock interval on resume, making
+# the AO briefly under-report its buffered latency and pushing video sync ahead.
+if ! grep -Eq '^[[:space:]]*\.set_pause[[:space:]]*=[[:space:]]*set_pause,' \
+	audio/out/ao_audiotrack.c; then
+	patch -p1 --forward --batch <<'PATCH'
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -19,5 +19,7 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
++#include <string.h>
++
+ #include "ao.h"
+ #include "internal.h"
+ #include "common/msg.h"
+@@ -41,6 +41,7 @@
+     int64_t timestamp_fetched;
+     bool timestamp_set;
+     int timestamp_stable;
++    int64_t timestamp_resume_time;
+ 
+     uint32_t written_frames; /* requires uint32_t rollover semantics */
+     uint32_t playhead_pos;
+@@ -49,6 +50,7 @@
+ 
+     void *chunk;
+     int chunksize;
++    int pending_bytes;
+     jbyteArray bytearray;
+     jshortArray shortarray;
+     jfloatArray floatarray;
+@@ -376,14 +376,23 @@
+             p->timestamp_stable = 0;
+         int64_t time1 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+         if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
+-            p->timestamp_set = true;
++            uint32_t fpos = 0xFFFFFFFFL &
++                MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
++            int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+             p->timestamp_fetched = now;
+-            if (p->timestamp_stable < stable_count) {
+-                uint32_t fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
+-                int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+-                //MP_VERBOSE(ao, "getTimestamp: fpos= %u / time= %"PRId64" / now= %"PRId64" / stable= %d\n", fpos, time2, now, p->timestamp_stable);
+-                if (time1 != time2 && time2 != 0 && fpos != 0) {
+-                    p->timestamp_stable++;
++
++            // play() can briefly expose the timestamp cached before pause().
++            // Do not extrapolate it across the paused wall-clock interval.
++            if (p->timestamp_resume_time && time2 < p->timestamp_resume_time) {
++                p->timestamp_set = false;
++                p->timestamp_stable = 0;
++            } else {
++                p->timestamp_set = true;
++                p->timestamp_resume_time = 0;
++                if (p->timestamp_stable < stable_count) {
++                    //MP_VERBOSE(ao, "getTimestamp: fpos= %u / time= %"PRId64" / now= %"PRId64" / stable= %d\n", fpos, time2, now, p->timestamp_stable);
++                    if (time1 != time2 && time2 != 0 && fpos != 0)
++                        p->timestamp_stable++;
+                 }
+             }
+         }
+@@ -543,12 +543,23 @@
+         if (state == AudioTrack.PLAYSTATE_PLAYING) {
+-            int read_samples = p->chunksize / ao->sstride;
+-            int64_t ts = mp_time_ns();
+-            ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
+-            ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+-            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
+-            int ret = AudioTrack_write(ao, samples * ao->sstride);
++            int bytes = p->pending_bytes;
++            if (!bytes) {
++                int read_samples = p->chunksize / ao->sstride;
++                int64_t ts = mp_time_ns();
++                ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
++                ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
++                int samples = ao_read_data(ao, &p->chunk, read_samples, ts,
++                                           NULL, false, false);
++                bytes = samples * ao->sstride;
++            }
++
++            int ret = AudioTrack_write(ao, bytes);
+             if (ret >= 0) {
++                mp_assert(ret <= bytes);
++                mp_assert(ret % ao->sstride == 0);
+                 p->written_frames += ret / ao->sstride;
++                p->pending_bytes = bytes - ret;
++                if (ret > 0 && p->pending_bytes > 0)
++                    memmove(p->chunk, (char *)p->chunk + ret, p->pending_bytes);
+             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
+                 MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
+                 if (AudioTrack_Recreate(ao) < 0) {
+@@ -758,27 +758,69 @@
+ 
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+-    MP_JNI_EXCEPTION_LOG(ao);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        return;
++
++    // pause() interrupts a blocking write. Wait until the audio thread has
++    // accounted any short write before flushing the device.
++    mp_mutex_lock(&p->lock);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+     MP_JNI_EXCEPTION_LOG(ao);
++
++    p->pending_bytes = 0;
+     p->playhead_offset = 0;
+     p->reset_pending = true;
+     p->written_frames = 0;
+     p->timestamp_fetched = 0;
+     p->timestamp_set = false;
++    p->timestamp_stable = 0;
++    p->timestamp_resume_time = 0;
++    mp_mutex_unlock(&p->lock);
++}
++
++static bool set_pause(struct ao *ao, bool paused)
++{
++    struct priv *p = ao->priv;
++    if (!p->audiotrack) {
++        MP_ERR(ao, "AudioTrack does not exist to %s!\n",
++               paused ? "pause" : "resume");
++        return false;
++    }
++
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    if (paused) {
++        // Do not take p->lock before pause(): the audio thread may hold it in a
++        // blocking write, and pause() is what interrupts that write.
++        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
++        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++            return false;
++
++        mp_mutex_lock(&p->lock);
++        p->timestamp_fetched = 0;
++        p->timestamp_set = false;
++        p->timestamp_stable = 0;
++        p->timestamp_resume_time = 0;
++        mp_mutex_unlock(&p->lock);
++        return true;
++    }
++
++    // Serialize play() with the audio thread. It must not observe PLAYING until
++    // the timestamp cache has been invalidated and the resume boundary saved.
++    mp_mutex_lock(&p->lock);
++    p->timestamp_fetched = 0;
++    p->timestamp_set = false;
++    p->timestamp_stable = 0;
++    p->timestamp_resume_time = mp_raw_time_ns();
++    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
++    int err = MP_JNI_EXCEPTION_LOG(ao);
++    if (err >= 0)
++        mp_cond_signal(&p->wakeup);
++    mp_mutex_unlock(&p->lock);
++
++    return err >= 0;
+ }
+ 
+ static void start(struct ao *ao)
+ {
+-    struct priv *p = ao->priv;
+-    if (!p->audiotrack) {
+-        MP_ERR(ao, "AudioTrack does not exist to start!\n");
+-        return;
+-    }
+-
+-    JNIEnv *env = MP_JNI_GET_ENV(ao);
+-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
+-    MP_JNI_EXCEPTION_LOG(ao);
+-
+-    mp_cond_signal(&p->wakeup);
++    set_pause(ao, false);
+ }
+@@ -789,6 +789,7 @@
+     .uninit    = uninit,
+     .reset     = stop,
+     .start     = start,
++    .set_pause = set_pause,
+     .priv_size = sizeof(struct priv),
+     .priv_defaults = &(const OPT_BASE_STRUCT) {
+         .cfg_pcm_float = 1,
+PATCH
+fi
 
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
