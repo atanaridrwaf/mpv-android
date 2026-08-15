@@ -165,52 +165,60 @@ marker = "mpv-android: preserve MediaCodec AImage FIFO order"
 if marker in src:
     raise SystemExit(0)
 
-replacements = [
-    (
-        "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
-        "    media_status_t (*AImageReader_acquireNextImage)(AImageReader *, AImage **);\n"
-        "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
-    ),
-    (
-        '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
-        '    { "AImageReader_acquireNextImage", offsetof(struct priv_owner, AImageReader_acquireNextImage) },\n'
-        '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
-    ),
-    (
-        "    bool image_available;\n",
-        "    uint64_t image_generation;\n"
-        "    bool recover_latest;\n",
-    ),
-    (
-        "    p->image_available = true;\n",
-        "    p->image_generation++;\n",
-    ),
-]
-for old, new in replacements:
-    if src.count(old) != 1:
-        raise SystemExit(f"mpv AImageReader FIFO patch failed: expected exactly one {old!r}")
+def replace_once(old, new, what):
+    global src
+    count = src.count(old)
+    if count != 1:
+        raise SystemExit(
+            f"mpv AImageReader FIFO patch failed: expected one {what}, found {count}"
+        )
     src = src.replace(old, new, 1)
 
-old_map = """    bool image_available = false;
-    mp_mutex_lock(&p->lock);
-    if (!p->image_available) {
-        mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
-        if (!p->image_available)
-            MP_WARN(mapper, \"Waiting for frame timed out!\\n\");
-    }
-    image_available = p->image_available;
-    p->image_available = false;
-    mp_mutex_unlock(&p->lock);
-    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-    if (ret != AMEDIA_OK) {
-        MP_ERR(mapper, \"acquireLatestImage failed: %d\\n\", ret);
-        // If we merely timed out waiting return success anyway to avoid
-        // flashing frames of render errors.
-        return image_available ? -1 : 0;
-    }
-    mp_assert(p->image);
-"""
-new_map = """    // mpv-android: preserve MediaCodec AImage FIFO order. The frame scheduler has
+replace_once(
+    "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
+    "    media_status_t (*AImageReader_acquireNextImage)(AImageReader *, AImage **);\n"
+    "    media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);\n",
+    "AImageReader function pointer",
+)
+replace_once(
+    '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
+    '    { "AImageReader_acquireNextImage", offsetof(struct priv_owner, AImageReader_acquireNextImage) },\n'
+    '    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },\n',
+    "AImageReader symbol entry",
+)
+replace_once(
+    "    bool image_available;\n",
+    "    uint64_t image_generation;\n"
+    "    bool recover_latest;\n",
+    "image availability state",
+)
+replace_once(
+    "    p->image_available = true;\n",
+    "    p->image_generation++;\n",
+    "image callback state update",
+)
+
+# Patch only the acquisition section inside mapper_map. Do not match the whole
+# function body: mpv master changes nearby whitespace/comments often.
+func_start = src.find("static int mapper_map(struct ra_hwdec_mapper *mapper)")
+func_end = src.find("\nconst struct ra_hwdec_driver ra_hwdec_aimagereader", func_start)
+if func_start < 0 or func_end < 0:
+    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map function not found")
+
+chunk = src[func_start:func_end]
+release_anchor = "        av_mediacodec_release_buffer(buffer, 1);\n    }\n"
+hwbuf_anchor = "    AHardwareBuffer *hwbuf = NULL;\n"
+release_pos = chunk.find(release_anchor)
+hwbuf_pos = chunk.find(hwbuf_anchor)
+if release_pos < 0 or hwbuf_pos < 0 or hwbuf_pos <= release_pos:
+    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map acquisition anchors not found")
+
+replace_start = release_pos + len(release_anchor)
+old_acquire = chunk[replace_start:hwbuf_pos]
+if "AImageReader_acquireLatestImage" not in old_acquire:
+    raise SystemExit("mpv AImageReader FIFO patch failed: unexpected mapper_map acquisition code")
+
+new_acquire = r'''    // mpv-android: preserve MediaCodec AImage FIFO order. The frame scheduler has
     // already chosen mapper->src, so silently replacing it with a newer queued
     // image here creates a visible time jump that --framedrop=no cannot prevent.
     uint64_t generation;
@@ -234,8 +242,8 @@ new_map = """    // mpv-android: preserve MediaCodec AImage FIFO order. The fram
             break;
         }
         if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-            MP_ERR(mapper, \"%s failed: %d\\n\",
-                   p->recover_latest ? \"acquireLatestImage\" : \"acquireNextImage\", ret);
+            MP_ERR(mapper, "%s failed: %d\n",
+                   p->recover_latest ? "acquireLatestImage" : "acquireNextImage", ret);
             return -1;
         }
 
@@ -263,11 +271,11 @@ new_map = """    // mpv-android: preserve MediaCodec AImage FIFO order. The fram
                 break;
             }
             if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-                MP_ERR(mapper, \"AImageReader acquire after timeout failed: %d\\n\", ret);
+                MP_ERR(mapper, "AImageReader acquire after timeout failed: %d\n", ret);
                 return -1;
             }
 
-            MP_WARN(mapper, \"Waiting for frame timed out!\\n\");
+            MP_WARN(mapper, "Waiting for frame timed out!\n");
             // Match upstream's no-flash behavior for this map. The late image
             // must be drained on the next map so it cannot shift all following
             // frame associations by one.
@@ -276,10 +284,10 @@ new_map = """    // mpv-android: preserve MediaCodec AImage FIFO order. The fram
         }
     }
     mp_assert(p->image);
-"""
-if src.count(old_map) != 1:
-    raise SystemExit("mpv AImageReader FIFO patch failed: mapper_map block not found")
-src = src.replace(old_map, new_map, 1)
+'''
+
+chunk = chunk[:replace_start] + new_acquire + chunk[hwbuf_pos:]
+src = src[:func_start] + chunk + src[func_end:]
 path.write_text(src)
 PY_AIMAGEREADER_FIFO
 
