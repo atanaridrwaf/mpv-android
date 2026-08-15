@@ -59,9 +59,7 @@ androidComponents {
     beforeVariants(selector().all()) { variantBuilder ->
         if (githubActionsArm64ReleaseOnly) {
             def isDefaultRelease = variantBuilder.buildType == "release" &&
-                    variantBuilder.productFlavors.any {
-                        it.first == "default" && it.second == "default"
-                    }
+                    variantBuilder.productFlavors*.second.contains("default")
             if (!isDefaultRelease) {
                 variantBuilder.enable = false
             }
