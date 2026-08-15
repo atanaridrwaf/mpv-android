@@ -7,9 +7,6 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-24.04
-    env:
-      CI_ARCH: arm64
-      MPV_ANDROID_GITHUB_ACTIONS_ARM64_RELEASE_ONLY: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
@@ -18,7 +15,7 @@ jobs:
           distribution: temurin
 
       - name: Export env vars
-        run: buildscripts/include/ci.sh export >> "$GITHUB_ENV"
+        run: buildscripts/include/ci.sh export >>$GITHUB_ENV
 
       - uses: actions/cache@v5
         with:
@@ -40,57 +37,11 @@ jobs:
           CACHE_MODE: "folder"
           CACHE_FOLDER: "${{ github.workspace }}/gh-cache"
 
-      - name: Configure release signing
-        shell: bash
-        env:
-          ANDROID_SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_B64 }}
-          ANDROID_SIGNING_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
-          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
-          ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
-        run: |
-          set -euo pipefail
-
-          key_path="$RUNNER_TEMP/mpv-android-release.jks"
-
-          if [ -n "${ANDROID_SIGNING_KEY_B64:-}" ]; then
-            printf '%s' "$ANDROID_SIGNING_KEY_B64" | base64 --decode > "$key_path"
-
-            : "${ANDROID_SIGNING_KEYSTORE_PASSWORD:?ANDROID_SIGNING_KEYSTORE_PASSWORD secret is required when ANDROID_SIGNING_KEY_B64 is set}"
-            : "${ANDROID_SIGNING_ALIAS:?ANDROID_SIGNING_ALIAS secret is required when ANDROID_SIGNING_KEY_B64 is set}"
-
-            store_password="$ANDROID_SIGNING_KEYSTORE_PASSWORD"
-            key_password="${ANDROID_SIGNING_KEY_PASSWORD:-$ANDROID_SIGNING_KEYSTORE_PASSWORD}"
-            key_alias="$ANDROID_SIGNING_ALIAS"
-          else
-            store_password="$(openssl rand -base64 24)"
-            key_password="$store_password"
-            key_alias="mpv-android-github-actions"
-
-            keytool -genkeypair \
-              -keystore "$key_path" \
-              -storetype JKS \
-              -storepass "$store_password" \
-              -keypass "$key_password" \
-              -alias "$key_alias" \
-              -keyalg RSA \
-              -keysize 4096 \
-              -validity 10000 \
-              -dname "CN=GitHub Actions, O=mpv-android"
-          fi
-
-          {
-            echo "ANDROID_SIGNING_KEY=$key_path"
-            echo "ANDROID_SIGNING_STORE_PASSWORD=$store_password"
-            echo "ANDROID_SIGNING_KEY_PASSWORD=$key_password"
-            echo "ANDROID_SIGNING_ALIAS=$key_alias"
-          } >> "$GITHUB_ENV"
-
-      - name: Build default arm64-v8a release only
+      - name: Build
         run: |
           buildscripts/include/ci.sh build
 
       - uses: actions/upload-artifact@v7
         with:
-          name: mpv-android-default-arm64-v8a-release
-          path: app/build/outputs/apk/default/release/app-default-arm64-v8a-release-signed.apk
-          if-no-files-found: error
+          name: mpv-android
+          path: app/build/outputs/apk/default/debug/app-default-armeabi-v7a-debug.apk
