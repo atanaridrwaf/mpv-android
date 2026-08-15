@@ -85,8 +85,17 @@ fi
 msg "Building mpv"
 ./buildall.sh --arch "$ci_arch" -n mpv || {
 	# show logfile if configure failed
-	[ ! -f "deps/mpv/_build_${ci_arch}/config.h" ] && \
-		cat "deps/mpv/_build_${ci_arch}/meson-logs/meson-log.txt"
+	config_file="deps/mpv/_build_${ci_arch}/config.h"
+	log_file="deps/mpv/_build_${ci_arch}/meson-logs/meson-log.txt"
+
+	if [ ! -f "$config_file" ]; then
+		if [ -f "$log_file" ]; then
+			cat "$log_file"
+		else
+			echo "Meson configure failed, but no log file was found at: $log_file"
+		fi
+	fi
+
 	exit 1
 }
 
