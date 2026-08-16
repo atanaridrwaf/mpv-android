@@ -1193,49 +1193,80 @@ PY_FCI_MPV
 # localize the visible continuity loss to core-generated presentation targets.
 # This block only exposes the values that create those targets and AudioTrack's
 # reported delay state. It deliberately does not change pause/seek/video timing.
+#
+# Keep these injections deliberately tolerant of harmless upstream whitespace
+# and line-wrap changes: mpv-android fetches mpv master at build time.
 python3 - <<'PY_FCI_AVSYNC_AUDIO'
 from pathlib import Path
+import re
 
 
-def replace_once(text, old, new, label):
-    if text.count(old) != 1:
+def function_span(text, signature, label):
+    starts = [m.start() for m in re.finditer(re.escape(signature), text)]
+    if len(starts) != 1:
         raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
-                         f"expected one anchor, found {text.count(old)}")
-    return text.replace(old, new, 1)
+                         f"expected one function signature, found {len(starts)}")
+    start = starts[0]
+    brace = text.find("{", start + len(signature))
+    if brace < 0:
+        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
+                         "opening brace not found")
+    depth = 0
+    for i in range(brace, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
+                     "closing brace not found")
+
+
+def regex_once(text, pattern, repl, label, flags=0):
+    rx = re.compile(pattern, flags)
+    matches = list(rx.finditer(text))
+    if len(matches) != 1:
+        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
+                         f"expected one anchor, found {len(matches)}")
+    return rx.sub(repl, text, count=1)
+
+
+def regex_in_function(text, signature, pattern, repl, label, flags=0):
+    start, end = function_span(text, signature, label)
+    fn = text[start:end]
+    fn = regex_once(fn, pattern, repl, label, flags)
+    return text[:start] + fn + text[end:]
+
+
+def replace_in_function(text, signature, old, new, label):
+    start, end = function_span(text, signature, label)
+    fn = text[start:end]
+    count = fn.count(old)
+    if count != 1:
+        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
+                         f"expected one anchor, found {count}")
+    fn = fn.replace(old, new, 1)
+    return text[:start] + fn + text[end:]
 
 
 # Core: expose the exact audio-derived rewrite that determines the next video
-# presentation deadline.
+# presentation deadline. Match semantic assignment lines instead of a brittle
+# multi-line literal block.
 p = Path("player/video.c")
 src = p.read_text()
 if "FCI_AVSYNC_REWRITE" not in src:
-    src = replace_once(
+    src = regex_in_function(
         src,
-        '''        double buffered_audio = ao_get_delay(mpctx->ao);
-        double predicted = mpctx->delay / mpctx->video_speed +
-                           mpctx->time_frame;
-        double difference = buffered_audio - predicted;
-        MP_STATS(mpctx, "value %f audio-diff", difference);
-        if (opts->autosync) {
-''',
-        '''        double fci_time_frame_before = mpctx->time_frame;
-        double fci_delay_before = mpctx->delay;
-        double buffered_audio = ao_get_delay(mpctx->ao);
-        double predicted = mpctx->delay / mpctx->video_speed +
-                           mpctx->time_frame;
-        double difference = buffered_audio - predicted;
-        MP_STATS(mpctx, "value %f audio-diff", difference);
-        if (opts->autosync) {
-''',
-        "video avsync inputs",
+        "static void update_avsync_before_frame(struct MPContext *mpctx)",
+        r'(?m)^(?P<i>[ \t]*)double[ \t]+buffered_audio[ \t]*=[ \t]*ao_get_delay\(mpctx->ao\);[ \t]*$',
+        lambda m: (m.group('i') + 'double fci_time_frame_before = mpctx->time_frame;\n' +
+                   m.group('i') + 'double fci_delay_before = mpctx->delay;\n' +
+                   m.group(0)),
+        "video avsync input",
     )
-    src = replace_once(
-        src,
-        '''        mpctx->time_frame = buffered_audio - mpctx->delay / mpctx->video_speed;
-    } else {
-''',
-        '''        mpctx->time_frame = buffered_audio - mpctx->delay / mpctx->video_speed;
-        MP_INFO(mpctx,
+    avsync_log = '''MP_INFO(mpctx,
                 "FCI_AVSYNC_REWRITE video_pts=%.9f audio_status=%d video_status=%d "
                 "time_frame_before=%.9f buffered_audio=%.9f delay_before=%.9f "
                 "delay_after=%.9f video_speed=%.9f predicted=%.9f difference=%.9f "
@@ -1243,26 +1274,24 @@ if "FCI_AVSYNC_REWRITE" not in src:
                 mpctx->video_pts, mpctx->audio_status, mpctx->video_status,
                 fci_time_frame_before, buffered_audio, fci_delay_before,
                 mpctx->delay, mpctx->video_speed, predicted, difference,
-                opts->autosync, mpctx->time_frame, (long long)mp_time_ns());
-    } else {
-''',
+                opts->autosync, mpctx->time_frame, (long long)mp_time_ns());'''
+    src = regex_in_function(
+        src,
+        "static void update_avsync_before_frame(struct MPContext *mpctx)",
+        r'(?m)^(?P<i>[ \t]*)mpctx->time_frame[ \t]*=[ \t]*buffered_audio[ \t]*-[ \t]*mpctx->delay[ \t]*/[ \t]*mpctx->video_speed[ \t]*;[ \t]*$',
+        lambda m: m.group(0) + '\n' + m.group('i') + avsync_log,
         "video avsync result",
     )
     p.write_text(src)
 
 
-# Generic AO wrapper: record the asynchronous end-time updates used by pull
-# AOs, then split ao_get_delay() into its device/end-time and software-queue
-# components. Returned timing values are unchanged.
+# Generic AO wrapper: record asynchronous end-time updates used by pull AOs,
+# then split ao_get_delay() into its end-time and software-queue components.
+# Returned timing values are unchanged.
 p = Path("audio/out/buffer.c")
 src = p.read_text()
 if "FCI_AO_ENDTIME_UPDATE" not in src:
-    src = replace_once(
-        src,
-        '''    if (pos > 0)
-        p->end_time_ns = out_time_ns;
-''',
-        '''    if (pos > 0) {
+    endtime_block = '''if (pos > 0) {
         int64_t fci_old_end = p->end_time_ns;
         p->end_time_ns = out_time_ns;
         int64_t fci_now = mp_time_ns();
@@ -1273,21 +1302,17 @@ if "FCI_AO_ENDTIME_UPDATE" not in src:
                 (long long)(p->end_time_ns - fci_old_end),
                 (long long)fci_now,
                 (p->end_time_ns - fci_now) / 1e6);
-    }
-''',
+    }'''
+    src = regex_in_function(
+        src,
+        "static int ao_read_data_locked(struct ao *ao, void **data, int samples,",
+        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(pos[ \t]*>[ \t]*0\)[ \t]*\n[ \t]+p->end_time_ns[ \t]*=[ \t]*out_time_ns;[ \t]*$',
+        lambda m: m.group('i') + endtime_block,
         "pull ao end-time update",
     )
 
 if "FCI_AO_DELAY" not in src:
-    src = replace_once(
-        src,
-        '''    int64_t pending = mp_async_queue_get_samples(p->queue);
-    if (p->pending)
-        pending += mp_aframe_get_size(p->pending);
-    mp_mutex_unlock(&p->lock);
-    return driver_delay + pending / (double)ao->samplerate;
-''',
-        '''    int64_t pending = mp_async_queue_get_samples(p->queue);
+    delay_block = '''int64_t pending = mp_async_queue_get_samples(p->queue);
     if (p->pending)
         pending += mp_aframe_get_size(p->pending);
     double pending_delay = pending / (double)ao->samplerate;
@@ -1306,35 +1331,23 @@ if "FCI_AO_DELAY" not in src:
             (long long)fci_end_time, (long long)pending, pending_delay,
             total_delay, fci_playing, fci_paused, fci_streaming, fci_hw_paused,
             (long long)mp_time_ns());
-    return total_delay;
-''',
+    return total_delay;'''
+    src = regex_in_function(
+        src,
+        "double ao_get_delay(struct ao *ao)",
+        r'(?ms)^(?P<i>[ \t]*)int64_t[ \t]+pending[ \t]*=[ \t]*mp_async_queue_get_samples\(p->queue\);[ \t]*\n(?P=i)if[ \t]*\(p->pending\)[ \t]*\n[ \t]+pending[ \t]*\+=[ \t]*mp_aframe_get_size\(p->pending\);[ \t]*\n(?P=i)mp_mutex_unlock\(&p->lock\);[ \t]*\n(?P=i)return[ \t]+driver_delay[ \t]*\+[ \t]*pending[ \t]*/[ \t]*\(double\)ao->samplerate;[ \t]*$',
+        lambda m: m.group('i') + delay_block,
         "generic ao delay",
     )
     p.write_text(src)
 
 
 # Android AudioTrack: expose the state used to produce the driver's delay.
-# This preserves the original single getLatency() JNI call and all arithmetic;
-# the extra field reads are diagnostics only.
+# Preserve the original single getLatency() JNI call and all return semantics.
 p = Path("audio/out/ao_audiotrack.c")
 src = p.read_text()
 if "FCI_AT_LATENCY" not in src:
-    src = replace_once(
-        src,
-        '''    uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao);
-    uint32_t diff = p->written_frames - playhead;
-    double delay = diff / (double)(ao->samplerate);
-    if (!p->timestamp_set &&
-        p->format != AudioFormat.ENCODING_IEC61937)
-        delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
-    if (delay > 2.0) {
-        //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\\n", p->written_frames, playhead, diff, delay);
-        p->timestamp_fetched = 0;
-        return 0;
-    }
-    return MPCLAMP(delay, 0.0, 2.0);
-''',
-        '''    bool fci_ts_before = p->timestamp_set;
+    latency_block = '''bool fci_ts_before = p->timestamp_set;
     int fci_stable_before = p->timestamp_stable;
     int64_t fci_fetched_before = p->timestamp_fetched;
     uint32_t fci_raw_before = p->playhead_pos;
@@ -1377,108 +1390,86 @@ if "FCI_AT_LATENCY" not in src:
         p->timestamp_fetched = 0;
         return 0;
     }
-    return result;
-''',
+    return result;'''
+    src = regex_in_function(
+        src,
+        "static double AudioTrack_getLatency(struct ao *ao)",
+        r'(?ms)^(?P<i>[ \t]*)uint32_t[ \t]+playhead[ \t]*=[ \t]*AudioTrack_getPlaybackHeadPosition\(ao\);[ \t]*\n(?P=i)uint32_t[ \t]+diff[ \t]*=[ \t]*p->written_frames[ \t]*-[ \t]*playhead;[ \t]*\n(?P=i)double[ \t]+delay[ \t]*=[ \t]*diff[ \t]*/[ \t]*\(double\)\(ao->samplerate\);[ \t]*\n(?P=i)if[ \t]*\(!p->timestamp_set[ \t]*&&[ \t]*\n[ \t]*p->format[ \t]*!=[ \t]*AudioFormat\.ENCODING_IEC61937\)[ \t]*\n[ \t]*delay[ \t]*\+=[ \t]*\(double\)MP_JNI_CALL_INT\(p->audiotrack,[ \t]*AudioTrack\.getLatency\)[ \t]*/[ \t]*1000\.0;[ \t]*\n(?P=i)if[ \t]*\(delay[ \t]*>[ \t]*2\.0\)[ \t]*\{.*?\n(?P=i)\}[ \t]*\n(?P=i)return[ \t]+MPCLAMP\(delay,[ \t]*0\.0,[ \t]*2\.0\);[ \t]*$',
+        lambda m: m.group('i') + latency_block,
         "AudioTrack latency state",
     )
 
+# set_pause() is introduced by the hardware-pause patch above, so its body is
+# under our control. Do not read thread-owned counters here without its mutex.
 if "FCI_AT_SET_PAUSE" not in src:
-    src = replace_once(
+    src = replace_in_function(
         src,
+        "static bool set_pause(struct ao *ao, bool paused)",
         '''    // Do not take p->lock here. The audio thread holds it while blocked in
     // AudioTrack.write(), and pause() is what interrupts that write.
     JNIEnv *env = MP_JNI_GET_ENV(ao);
-    if (paused)
 ''',
         '''    // Do not take p->lock here. The audio thread holds it while blocked in
     // AudioTrack.write(), and pause() is what interrupts that write.
-    MP_INFO(ao,
-            "FCI_AT_SET_PAUSE phase=before action=%s written=%u pending_bytes=%d "
-            "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
-            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
-            paused ? "PAUSE" : "RESUME", p->written_frames, p->pending_bytes,
-            p->timestamp_set, p->timestamp_stable,
-            (long long)p->timestamp_fetched, p->playhead_pos, p->playhead_offset,
-            p->reset_pending, (long long)mp_raw_time_ns());
+    MP_INFO(ao, "FCI_AT_SET_PAUSE phase=before action=%s raw_ns=%lld\\n",
+            paused ? "PAUSE" : "RESUME", (long long)mp_raw_time_ns());
     JNIEnv *env = MP_JNI_GET_ENV(ao);
-    if (paused)
 ''',
         "AudioTrack pause before",
     )
-    src = replace_once(
+    pause_after_log = '''MP_INFO(ao, "FCI_AT_SET_PAUSE phase=after action=%s raw_ns=%lld\\n",
+            paused ? "PAUSE" : "RESUME", (long long)mp_raw_time_ns());'''
+    src = regex_in_function(
         src,
-        '''    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-        return false;
-
-    if (!paused)
-        mp_cond_signal(&p->wakeup);
-
-    return true;
-}
-''',
-        '''    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-        return false;
-
-    MP_INFO(ao,
-            "FCI_AT_SET_PAUSE phase=after action=%s written=%u pending_bytes=%d "
-            "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
-            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
-            paused ? "PAUSE" : "RESUME", p->written_frames, p->pending_bytes,
-            p->timestamp_set, p->timestamp_stable,
-            (long long)p->timestamp_fetched, p->playhead_pos, p->playhead_offset,
-            p->reset_pending, (long long)mp_raw_time_ns());
-
-    if (!paused)
-        mp_cond_signal(&p->wakeup);
-
-    return true;
-}
-''',
+        "static bool set_pause(struct ao *ao, bool paused)",
+        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(MP_JNI_EXCEPTION_LOG\(ao\)[ \t]*<[ \t]*0\)[ \t]*\n[ \t]+return[ \t]+false;[ \t]*\n(?P<blank>[ \t]*\n)?(?P=i)if[ \t]*\(!paused\)[ \t]*$',
+        lambda m: (m.group('i') + 'if (MP_JNI_EXCEPTION_LOG(ao) < 0)\n' +
+                   m.group('i') + '    return false;\n\n' +
+                   m.group('i') + pause_after_log + '\n\n' +
+                   m.group('i') + 'if (!paused)'),
         "AudioTrack pause after",
     )
 
+# stop() is the reset/seek path. Read its mutable counters only while p->lock
+# is held, so diagnostics do not add a data race to the AudioTrack thread.
 if "FCI_AT_RESET" not in src:
-    src = replace_once(
+    src = replace_in_function(
         src,
-        '''    JNIEnv *env = MP_JNI_GET_ENV(ao);
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
-    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-        return;
+        "static void stop(struct ao *ao)",
+        '''    mp_mutex_lock(&p->lock);
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
 ''',
-        '''    MP_INFO(ao,
-            "FCI_AT_RESET phase=before written=%u pending_bytes=%d timestamp_set=%d "
-            "timestamp_stable=%d timestamp_fetched=%lld playhead_pos=%u "
-            "playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
-            p->written_frames, p->pending_bytes, p->timestamp_set,
-            p->timestamp_stable, (long long)p->timestamp_fetched,
-            p->playhead_pos, p->playhead_offset, p->reset_pending,
-            (long long)mp_raw_time_ns());
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
-    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-        return;
-''',
-        "AudioTrack reset before",
-    )
-    src = replace_once(
-        src,
-        '''    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    mp_mutex_unlock(&p->lock);
-}
-''',
-        '''    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    mp_mutex_unlock(&p->lock);
+        '''    mp_mutex_lock(&p->lock);
     MP_INFO(ao,
-            "FCI_AT_RESET phase=after written=%u pending_bytes=%d timestamp_set=%d "
-            "timestamp_stable=%d timestamp_fetched=%lld playhead_pos=%u "
-            "playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
+            "FCI_AT_RESET phase=before_flush written=%u pending_bytes=%d "
+            "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
+            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
             p->written_frames, p->pending_bytes, p->timestamp_set,
             p->timestamp_stable, (long long)p->timestamp_fetched,
             p->playhead_pos, p->playhead_offset, p->reset_pending,
             (long long)mp_raw_time_ns());
-}
+    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+''',
+        "AudioTrack reset before flush",
+    )
+    src = replace_in_function(
+        src,
+        "static void stop(struct ao *ao)",
+        '''    p->timestamp_fetched = 0;
+    p->timestamp_set = false;
+    mp_mutex_unlock(&p->lock);
+''',
+        '''    p->timestamp_fetched = 0;
+    p->timestamp_set = false;
+    MP_INFO(ao,
+            "FCI_AT_RESET phase=after_reset written=%u pending_bytes=%d "
+            "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
+            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
+            p->written_frames, p->pending_bytes, p->timestamp_set,
+            p->timestamp_stable, (long long)p->timestamp_fetched,
+            p->playhead_pos, p->playhead_offset, p->reset_pending,
+            (long long)mp_raw_time_ns());
+    mp_mutex_unlock(&p->lock);
 ''',
         "AudioTrack reset after",
     )
