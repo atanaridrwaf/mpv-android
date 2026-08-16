@@ -146,6 +146,268 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
+# AudioTrack's AudioTimestamp may lag behind a hardware pause/resume transition.
+# Do not let a pre-pause timestamp be extrapolated across the paused wall-clock
+# interval: re-arm timestamp tracking after play() and use playback-head position
+# until Android reports a post-resume timestamp whose frame position advances.
+if ! grep -q 'timestamp_resume_rearming' audio/out/ao_audiotrack.c; then
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("audio/out/ao_audiotrack.c")
+s = path.read_text()
+
+def replace_once(old, new, label):
+    global s
+    n = s.count(old)
+    if n != 1:
+        raise SystemExit(f"AudioTrack resume-clock patch: {label}: expected 1 match, got {n}")
+    s = s.replace(old, new, 1)
+
+replace_once(
+    '#include <string.h>\n',
+    '#include <string.h>\n#include <time.h>\n',
+    'time.h include')
+
+replace_once(
+'''    int64_t timestamp_fetched;
+    bool timestamp_set;
+    int timestamp_stable;
+''',
+'''    int64_t timestamp_fetched;
+    bool timestamp_set;
+    int timestamp_stable;
+    int64_t timestamp_resume_epoch_ns;
+    uint32_t timestamp_resume_frame;
+    int64_t timestamp_resume_time_ns;
+    bool timestamp_resume_pending;
+    bool timestamp_resume_rearming;
+    bool timestamp_resume_sampled;
+''',
+    'timestamp resume state')
+
+replace_once(
+'''static int AudioTrack_Recreate(struct ao *ao)
+{
+''',
+'''static int64_t AudioTrack_monotonic_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return 0;
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void AudioTrack_invalidate_timestamp(struct priv *p)
+{
+    p->timestamp_fetched = 0;
+    p->timestamp_set = false;
+    p->timestamp_stable = 0;
+}
+
+static void AudioTrack_clear_resume_timestamp_state(struct priv *p)
+{
+    p->timestamp_resume_epoch_ns = 0;
+    p->timestamp_resume_frame = 0;
+    p->timestamp_resume_time_ns = 0;
+    p->timestamp_resume_rearming = false;
+    p->timestamp_resume_sampled = false;
+}
+
+static int AudioTrack_Recreate(struct ao *ao)
+{
+''',
+    'timestamp helper insertion')
+
+replace_once(
+'''    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+    MP_JNI_EXCEPTION_LOG(ao);
+    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
+    return AudioTrack_New(ao);
+}
+static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+''',
+'''    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+    MP_JNI_EXCEPTION_LOG(ao);
+    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
+    AudioTrack_invalidate_timestamp(p);
+    p->timestamp_resume_pending = false;
+    AudioTrack_clear_resume_timestamp_state(p);
+    return AudioTrack_New(ao);
+}
+static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+''',
+    'recreate timestamp reset')
+
+replace_once(
+'''    int64_t now = mp_raw_time_ns();
+''',
+'''    // AudioTimestamp.nanoTime is in Android's MONOTONIC timebase. Keep the
+    // extrapolation clock in the same timebase instead of CLOCK_MONOTONIC_RAW.
+    int64_t now = AudioTrack_monotonic_ns();
+    if (!now)
+        now = mp_raw_time_ns();
+''',
+    'timestamp clock')
+
+replace_once(
+'''        int64_t time1 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+        if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
+            p->timestamp_set = true;
+            p->timestamp_fetched = now;
+            if (p->timestamp_stable < stable_count) {
+                uint32_t fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
+                int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+                //MP_VERBOSE(ao, "getTimestamp: fpos= %u / time= %"PRId64" / now= %"PRId64" / stable= %d\\n", fpos, time2, now, p->timestamp_stable);
+                if (time1 != time2 && time2 != 0 && fpos != 0) {
+                    p->timestamp_stable++;
+                }
+            }
+        }
+''',
+'''        int64_t time1 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+        if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
+            uint32_t fpos = 0xFFFFFFFFL &
+                MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
+            int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+            bool accept = true;
+
+            if (p->timestamp_resume_rearming) {
+                // A getTimestamp() immediately after play() is allowed to expose
+                // a sample from the old paused clock epoch. Do not extrapolate it
+                // over the pause interval. Require a timestamp produced after the
+                // play() transition and then observable frame-position progress.
+                if (!time2 || !fpos || !p->timestamp_resume_epoch_ns ||
+                    time2 < p->timestamp_resume_epoch_ns)
+                {
+                    accept = false;
+                } else if (!p->timestamp_resume_sampled) {
+                    p->timestamp_resume_frame = fpos;
+                    p->timestamp_resume_time_ns = time2;
+                    p->timestamp_resume_sampled = true;
+                    accept = false;
+                } else {
+                    uint32_t advanced = fpos - p->timestamp_resume_frame;
+                    if (advanced > 0 && time2 > p->timestamp_resume_time_ns) {
+                        p->timestamp_resume_rearming = false;
+                        p->timestamp_resume_sampled = false;
+                        MP_VERBOSE(ao, "resume: AudioTimestamp re-armed at frame=%u time=%"PRId64"\\n",
+                                   fpos, time2);
+                    } else {
+                        p->timestamp_resume_frame = fpos;
+                        p->timestamp_resume_time_ns = time2;
+                        accept = false;
+                    }
+                }
+            }
+
+            p->timestamp_fetched = now;
+            if (accept) {
+                p->timestamp_set = true;
+                if (p->timestamp_stable < stable_count &&
+                    time1 != time2 && time2 != 0 && fpos != 0)
+                {
+                    p->timestamp_stable++;
+                }
+            } else {
+                // getPlaybackHeadPosition() below is continuous across pause/play
+                // and is therefore the safe clock while AudioTimestamp stabilizes.
+                p->timestamp_set = false;
+                p->timestamp_stable = 0;
+            }
+        } else if (p->timestamp_resume_rearming) {
+            // Poll at the normal 50 ms unstable-timestamp cadence while falling
+            // back to playbackHeadPosition; do not reuse a pre-pause timestamp.
+            p->timestamp_fetched = now;
+            p->timestamp_set = false;
+            p->timestamp_stable = 0;
+        }
+''',
+    'timestamp reacquisition')
+
+replace_once(
+'''    p->written_frames = 0;
+    p->timestamp_fetched = 0;
+    p->timestamp_set = false;
+    mp_mutex_unlock(&p->lock);
+}
+
+static bool set_pause(struct ao *ao, bool paused)
+''',
+'''    p->written_frames = 0;
+    AudioTrack_invalidate_timestamp(p);
+    p->timestamp_resume_pending = false;
+    AudioTrack_clear_resume_timestamp_state(p);
+    mp_mutex_unlock(&p->lock);
+}
+
+static bool set_pause(struct ao *ao, bool paused)
+''',
+    'real reset timestamp state')
+
+replace_once(
+'''    // Do not take p->lock here. The audio thread holds it while blocked in
+    // AudioTrack.write(), and pause() is what interrupts that write.
+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    if (paused)
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+    else
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
+
+    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+        return false;
+
+    if (!paused)
+        mp_cond_signal(&p->wakeup);
+
+    return true;
+''',
+'''    JNIEnv *env = MP_JNI_GET_ENV(ao);
+    if (paused) {
+        // Do not take p->lock before pause(): the audio thread may hold it while
+        // blocked in AudioTrack.write(), and pause() is what releases that write.
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+            return false;
+
+        mp_mutex_lock(&p->lock);
+        AudioTrack_invalidate_timestamp(p);
+        p->timestamp_resume_pending = true;
+        AudioTrack_clear_resume_timestamp_state(p);
+        int pending = p->pending_bytes;
+        mp_mutex_unlock(&p->lock);
+        MP_VERBOSE(ao, "pause: AudioTrack queue preserved, pending=%d bytes\\n", pending);
+    } else {
+        // During resume the audio thread is no longer inside a blocking write.
+        // Keep it behind p->lock until the post-play timestamp epoch is armed, so
+        // no latency query can extrapolate a stale AudioTimestamp in between.
+        mp_mutex_lock(&p->lock);
+        AudioTrack_invalidate_timestamp(p);
+        AudioTrack_clear_resume_timestamp_state(p);
+        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+            mp_mutex_unlock(&p->lock);
+            return false;
+        }
+        if (p->timestamp_resume_pending) {
+            p->timestamp_resume_epoch_ns = AudioTrack_monotonic_ns();
+            p->timestamp_resume_rearming = p->timestamp_resume_epoch_ns > 0;
+            p->timestamp_resume_sampled = false;
+        }
+        p->timestamp_resume_pending = false;
+        mp_mutex_unlock(&p->lock);
+        mp_cond_signal(&p->wakeup);
+        MP_VERBOSE(ao, "resume: AudioTrack queue preserved; timestamp epoch re-armed\\n");
+    }
+
+    return true;
+''',
+    'hardware pause/resume clock fencing')
+
+path.write_text(s)
+PY
+fi
+
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
 # their target and performs one seek to the closest result in the requested
