@@ -37,16 +37,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
 
         /* set hardcoded options */
         postInitOptions()
-
-        // This project renders mpv into a TextureView SurfaceTexture instead of the
-        // upstream SurfaceView. Keep only one frame in flight so Android's final
-        // BufferQueue cannot hide a short burst of already-rendered frames when
-        // playback is resumed. This is a runtime option/property, so set it through
-        // the property API after mpv_initialize() rather than mpv_set_option_string().
-        MPVLib.setPropertyInt("swapchain-depth", 1)
-        Log.v(TAG,
-            "TextureView presentation: swapchain-depth=${MPVLib.getPropertyInt("swapchain-depth")}")
-
         // could mess up VO init before surfaceCreated() is called
         MPVLib.setOptionString("force-window", "no")
         // need to idle at least once for playFile() logic to work

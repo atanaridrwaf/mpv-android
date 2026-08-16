@@ -54,6 +54,12 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     private var maxAbsDy = 0f
     // latest point that still belonged clearly to the active movement axis
     private var directionAnchor = PointF()
+    // Android/OEM navigation gesture handlers can temporarily own an edge swipe, then replay
+    // the touch stream into the app when Home/Back/Recents was not triggered. Remember which
+    // navigation edges the touch started in so that replay cannot become a player gesture.
+    private var navigationGestureFromLeft = false
+    private var navigationGestureFromRight = false
+    private var navigationGestureFromBottom = false
     // Once a horizontal seek is active, a vertical turn pauses seek updates instead of
     // finalizing the gesture. The frozen horizontal delta lets a later horizontal turn
     // continue from the same seek target without counting sideways drift from the vertical leg.
@@ -112,6 +118,17 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // this is so that user can open android status bar
         private const val DEADZONE = 5
 
+        // Legacy three-button swipe navigation (notably Samsung's NavbarGestureHandler) owns a
+        // much wider invisible strip than the visible navigation hint. In the supplied landscape
+        // log it occupies the outer 300px of a 2220px display, so reserve the outer 15% while
+        // deciding whether an inward movement belongs to system navigation.
+        private const val NAVIGATION_GESTURE_EDGE_PERCENT = 15
+
+        // A rejected OEM navigation gesture is replayed with its original event timestamps. A
+        // normal ACTION_DOWN reaches the app almost immediately; a replayed one arrives only
+        // after the system has spent time deciding that Home/Back/Recents was not completed.
+        private const val NAVIGATION_GESTURE_REPLAY_DELAY_MS = 80L
+
         // Seeking should feel like 1s steps on slow drag (Samsung-like).
         // We achieve this by sending seek updates more frequently than volume/brightness.
         private const val SEEK_THROTTLE_DIV = 24
@@ -129,6 +146,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         seekVerticalMovement = false
         frozenSeekDx = 0f
         lastTapTime = 0L
+        resetNavigationGestureCandidates()
     }
 
     private fun State.isControl(): Boolean {
@@ -139,6 +157,60 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
 
     private fun activationThreshold(gesture: State): Float {
         return if (gesture == State.ControlSeek) trigger / 4 else trigger
+    }
+
+    private fun resetNavigationGestureCandidates() {
+        navigationGestureFromLeft = false
+        navigationGestureFromRight = false
+        navigationGestureFromBottom = false
+    }
+
+    private fun updateNavigationGestureCandidates(p: PointF) {
+        val horizontalEdge = width * NAVIGATION_GESTURE_EDGE_PERCENT / 100f
+        val verticalEdge = height * NAVIGATION_GESTURE_EDGE_PERCENT / 100f
+        navigationGestureFromLeft = p.x <= horizontalEdge
+        navigationGestureFromRight = p.x >= width - horizontalEdge
+        navigationGestureFromBottom = p.y >= height - verticalEdge
+    }
+
+    private fun hasNavigationGestureCandidate(): Boolean {
+        return navigationGestureFromLeft || navigationGestureFromRight ||
+                navigationGestureFromBottom
+    }
+
+    private fun isDelayedNavigationGestureDown(e: MotionEvent): Boolean {
+        if (!hasNavigationGestureCandidate())
+            return false
+
+        return SystemClock.uptimeMillis() - e.eventTime >= NAVIGATION_GESTURE_REPLAY_DELAY_MS
+    }
+
+    private fun isInwardNavigationGesture(p: PointF): Boolean {
+        if (!hasNavigationGestureCandidate())
+            return false
+
+        val dx = p.x - initialPos.x
+        val dy = p.y - initialPos.y
+        val absDx = abs(dx)
+        val absDy = abs(dy)
+        val threshold = activationThreshold(State.ControlSeek)
+
+        // Use the same direction lock as player gestures. This leaves vertical brightness/volume
+        // gestures usable near a side edge while rejecting the horizontal inward swipe used by a
+        // landscape navigation bar (and vice versa for a bottom navigation bar).
+        val horizontalIntent =
+            absDx > threshold &&
+            (absDy == 0f || absDx / absDy >= DIRECTION_LOCK_RATIO)
+        val verticalIntent =
+            absDy > threshold &&
+            (absDx == 0f || absDy / absDx >= DIRECTION_LOCK_RATIO)
+
+        val horizontalNavigation = horizontalIntent &&
+                ((navigationGestureFromLeft && dx > 0f) ||
+                        (navigationGestureFromRight && dx < 0f))
+        val bottomNavigation =
+            verticalIntent && navigationGestureFromBottom && dy < 0f
+        return horizontalNavigation || bottomNavigation
     }
 
     private fun activateGesture(
@@ -287,6 +359,13 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun processMovement(p: PointF): Boolean {
+        // Check this before normal direction detection. Otherwise a failed system navigation
+        // swipe replayed as DOWN/MOVE/UP can enter ControlSeek and commit an invisible seek.
+        if (state == State.Down && isInwardNavigationGesture(p)) {
+            state = State.Ignored
+            lastTapTime = 0L
+            return true
+        }
         if (state == State.ControlSeek && seekVerticalMovement &&
             processVerticalMovementDuringSeek(p)
         ) return true
@@ -415,12 +494,25 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
                 state = State.Up
                 seekVerticalMovement = false
                 frozenSeekDx = 0f
+                resetNavigationGestureCandidates()
             }
             MotionEvent.ACTION_DOWN -> {
+                resetNavigationGestureCandidates()
                 // deadzone on top/bottom
                 if (e.y < height * DEADZONE / 100 || e.y > height * (100 - DEADZONE) / 100)
                     return false
                 initialPos.set(point)
+                updateNavigationGestureCandidates(point)
+
+                // Samsung and some other OEMs replay a rejected navigation-button swipe only
+                // after the finger is lifted. Consume that stale stream before it can be mistaken
+                // for either a drag or a tap, including when the replay contains no MOVE event.
+                if (isDelayedNavigationGestureDown(e)) {
+                    state = State.Ignored
+                    lastTapTime = 0L
+                    return true
+                }
+
                 processTap(point)
                 lastPos.set(point)
                 maxAbsDx = 0f
