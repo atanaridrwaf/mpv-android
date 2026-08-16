@@ -147,8 +147,8 @@ PATCH
 fi
 
 # Keep the hardware-pause fix above, but make AudioTrack's cached clock pause-safe.
-# Apply this after the known-good AudioTrack patch so the resulting C code is
-# identical to the clock fix, without relying on fragile combined patch hunks.
+# This stage intentionally uses structural anchors instead of matching a complete
+# upstream source block, so harmless mpv formatting changes do not break builds.
 if ! grep -q 'timestamp_resume_time' audio/out/ao_audiotrack.c; then
 	python3 - <<'PY_CLOCK_FIX'
 from pathlib import Path
@@ -156,112 +156,136 @@ from pathlib import Path
 path = Path("audio/out/ao_audiotrack.c")
 s = path.read_text()
 
+
 def replace_once(old, new, name):
     global s
     count = s.count(old)
     if count != 1:
-        raise SystemExit(f"clock fix: expected exactly one {name} block, found {count}")
+        raise SystemExit(f"clock fix: expected exactly one {name}, found {count}")
     s = s.replace(old, new, 1)
 
+
+def find_code_block(text, marker, name):
+    """Return marker/open/close indexes, ignoring braces in comments/strings."""
+    start = text.find(marker)
+    if start < 0:
+        raise SystemExit(f"clock fix: could not find {name}")
+    if text.find(marker, start + 1) >= 0:
+        raise SystemExit(f"clock fix: found more than one {name}")
+
+    brace = text.find("{", start + len(marker))
+    if brace < 0:
+        raise SystemExit(f"clock fix: could not find opening brace for {name}")
+
+    depth = 0
+    i = brace
+    state = "code"
+    while i < len(text):
+        c = text[i]
+        n = text[i + 1] if i + 1 < len(text) else ""
+
+        if state == "code":
+            if c == "/" and n == "/":
+                state = "line_comment"
+                i += 2
+                continue
+            if c == "/" and n == "*":
+                state = "block_comment"
+                i += 2
+                continue
+            if c == '"':
+                state = "string"
+                i += 1
+                continue
+            if c == "'":
+                state = "char"
+                i += 1
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return start, brace, i
+            i += 1
+            continue
+
+        if state == "line_comment":
+            if c == "\n":
+                state = "code"
+            i += 1
+            continue
+
+        if state == "block_comment":
+            if c == "*" and n == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if state in ("string", "char"):
+            quote = '"' if state == "string" else "'"
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                state = "code"
+            i += 1
+            continue
+
+    raise SystemExit(f"clock fix: unterminated block for {name}")
+
+
+# 1) Remember the monotonic boundary of the latest hardware resume.
 replace_once(
-'''    int64_t timestamp_fetched;
-    bool timestamp_set;
-    int timestamp_stable;
-
-    uint32_t written_frames;''',
-'''    int64_t timestamp_fetched;
-    bool timestamp_set;
-    int timestamp_stable;
-    int64_t timestamp_resume_time;
-
-    uint32_t written_frames;''',
-    "timestamp state",
+    "    int timestamp_stable;\n",
+    "    int timestamp_stable;\n"
+    "    int64_t timestamp_resume_time;\n",
+    "timestamp_stable field",
 )
 
-replace_once(
-'''        int64_t time1 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
-        if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
-            p->timestamp_set = true;
-            p->timestamp_fetched = now;
-            if (p->timestamp_stable < stable_count) {
-                uint32_t fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
-                int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
-                //MP_VERBOSE(ao, "getTimestamp: fpos= %u / time= %"PRId64" / now= %"PRId64" / stable= %d\n", fpos, time2, now, p->timestamp_stable);
-                if (time1 != time2 && time2 != 0 && fpos != 0) {
-                    p->timestamp_stable++;
-                }
-            }
-        }''',
-'''        int64_t time1 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
-        if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
-            uint32_t fpos = 0xFFFFFFFFL &
-                MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
-            int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
-            p->timestamp_fetched = now;
-
-            // play() can briefly expose the timestamp cached before pause().
-            // Do not extrapolate it across the paused wall-clock interval.
-            if (p->timestamp_resume_time && time2 < p->timestamp_resume_time) {
+# 2) Leave mpv's existing getTimestamp logic untouched, then reject only a
+# timestamp whose nanoTime still predates the most recent AudioTrack.play().
+marker = "AudioTrack.getTimestamp"
+_, _, close = find_code_block(s, marker, "AudioTrack.getTimestamp block")
+guard = '''
+            int64_t resume_time =
+                MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+            if (p->timestamp_resume_time && resume_time < p->timestamp_resume_time) {
                 p->timestamp_set = false;
                 p->timestamp_stable = 0;
-            } else {
-                p->timestamp_set = true;
+            } else if (p->timestamp_resume_time) {
                 p->timestamp_resume_time = 0;
-                if (p->timestamp_stable < stable_count) {
-                    //MP_VERBOSE(ao, "getTimestamp: fpos= %u / time= %"PRId64" / now= %"PRId64" / stable= %d\n", fpos, time2, now, p->timestamp_stable);
-                    if (time1 != time2 && time2 != 0 && fpos != 0)
-                        p->timestamp_stable++;
-                }
             }
-        }''',
-    "AudioTimestamp refresh",
-)
+'''
+insert_at = s.rfind("\n", 0, close) + 1
+s = s[:insert_at] + guard.lstrip("\n") + s[insert_at:]
 
-replace_once(
-'''    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    mp_mutex_unlock(&p->lock);
-}''',
-'''    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    p->timestamp_stable = 0;
-    p->timestamp_resume_time = 0;
-    mp_mutex_unlock(&p->lock);
-}''',
-    "stop timestamp reset",
+# 3) A full reset/flush must also clear the resume boundary and stability state.
+_, stop_open, stop_close = find_code_block(s, "static void stop(struct ao *ao)", "stop()")
+stop_body = s[stop_open + 1:stop_close]
+needle = "    p->timestamp_set = false;\n"
+if stop_body.count(needle) != 1:
+    raise SystemExit(
+        f"clock fix: expected one timestamp_set reset in stop(), found {stop_body.count(needle)}"
+    )
+stop_body = stop_body.replace(
+    needle,
+    needle + "    p->timestamp_stable = 0;\n    p->timestamp_resume_time = 0;\n",
+    1,
 )
+s = s[:stop_open + 1] + stop_body + s[stop_close:]
 
-replace_once(
-'''static bool set_pause(struct ao *ao, bool paused)
+# 4) The base patch above creates set_pause(). Replace that generated function
+# structurally, not by comparing its exact whitespace/text.
+set_marker = "static bool set_pause(struct ao *ao, bool paused)"
+set_start, _, set_close = find_code_block(s, set_marker, "set_pause()")
+set_pause_code = '''static bool set_pause(struct ao *ao, bool paused)
 {
     struct priv *p = ao->priv;
     if (!p->audiotrack) {
-        MP_ERR(ao, "AudioTrack does not exist to %s!\n",
-               paused ? "pause" : "resume");
-        return false;
-    }
-
-    // Do not take p->lock here. The audio thread holds it while blocked in
-    // AudioTrack.write(), and pause() is what interrupts that write.
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-    if (paused)
-        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
-    else
-        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
-
-    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
-        return false;
-
-    if (!paused)
-        mp_cond_signal(&p->wakeup);
-
-    return true;
-}''',
-'''static bool set_pause(struct ao *ao, bool paused)
-{
-    struct priv *p = ao->priv;
-    if (!p->audiotrack) {
-        MP_ERR(ao, "AudioTrack does not exist to %s!\n",
+        MP_ERR(ao, "AudioTrack does not exist to %s!\\n",
                paused ? "pause" : "resume");
         return false;
     }
@@ -297,9 +321,8 @@ replace_once(
     mp_mutex_unlock(&p->lock);
 
     return err >= 0;
-}''',
-    "set_pause",
-)
+}'''
+s = s[:set_start] + set_pause_code + s[set_close + 1:]
 
 path.write_text(s)
 PY_CLOCK_FIX
