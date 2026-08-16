@@ -1312,11 +1312,12 @@ if "FCI_AO_ENDTIME_UPDATE" not in src:
     )
 
 if "FCI_AO_DELAY" not in src:
-    delay_block = '''int64_t pending = mp_async_queue_get_samples(p->queue);
-    if (p->pending)
-        pending += mp_aframe_get_size(p->pending);
-    double pending_delay = pending / (double)ao->samplerate;
-    double total_delay = driver_delay + pending_delay;
+    # Do not replace the whole pending/return block: upstream has changed that
+    # formatting more than once. ao_get_delay() has one unlock after it has
+    # computed both driver_delay and pending; copy state immediately before
+    # that unlock, log after unlocking, and leave the original return intact.
+    delay_probe = r'''double fci_pending_delay = pending / (double)ao->samplerate;
+    double fci_total_delay = driver_delay + fci_pending_delay;
     bool fci_playing = p->playing;
     bool fci_paused = p->paused;
     bool fci_streaming = p->streaming;
@@ -1326,18 +1327,17 @@ if "FCI_AO_DELAY" not in src:
     MP_INFO(ao,
             "FCI_AO_DELAY source=%s device_or_end=%.9f end_time_ns=%lld "
             "pending_samples=%lld pending_delay=%.9f total=%.9f "
-            "playing=%d paused=%d streaming=%d hw_paused=%d mp_ns=%lld\\n",
+            "playing=%d paused=%d streaming=%d hw_paused=%d mp_ns=%lld\n",
             ao->driver->write ? "driver" : "endtime", driver_delay,
-            (long long)fci_end_time, (long long)pending, pending_delay,
-            total_delay, fci_playing, fci_paused, fci_streaming, fci_hw_paused,
-            (long long)mp_time_ns());
-    return total_delay;'''
+            (long long)fci_end_time, (long long)pending, fci_pending_delay,
+            fci_total_delay, fci_playing, fci_paused, fci_streaming,
+            fci_hw_paused, (long long)mp_time_ns());'''
     src = regex_in_function(
         src,
         "double ao_get_delay(struct ao *ao)",
-        r'(?ms)^(?P<i>[ \t]*)int64_t[ \t]+pending[ \t]*=[ \t]*mp_async_queue_get_samples\(p->queue\);[ \t]*\n(?P=i)if[ \t]*\(p->pending\)[ \t]*\n[ \t]+pending[ \t]*\+=[ \t]*mp_aframe_get_size\(p->pending\);[ \t]*\n(?P=i)mp_mutex_unlock\(&p->lock\);[ \t]*\n(?P=i)return[ \t]+driver_delay[ \t]*\+[ \t]*pending[ \t]*/[ \t]*\(double\)ao->samplerate;[ \t]*$',
-        lambda m: m.group('i') + delay_block,
-        "generic ao delay",
+        r'(?m)^(?P<i>[ \t]*)mp_mutex_unlock\(&p->lock\);[ \t]*$',
+        lambda m: m.group('i') + delay_probe,
+        "generic ao delay unlock",
     )
     p.write_text(src)
 
@@ -1347,56 +1347,50 @@ if "FCI_AO_DELAY" not in src:
 p = Path("audio/out/ao_audiotrack.c")
 src = p.read_text()
 if "FCI_AT_LATENCY" not in src:
-    latency_block = '''bool fci_ts_before = p->timestamp_set;
-    int fci_stable_before = p->timestamp_stable;
-    int64_t fci_fetched_before = p->timestamp_fetched;
-    uint32_t fci_raw_before = p->playhead_pos;
-    uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao);
-    bool fci_ts_after = p->timestamp_set;
-    uint32_t diff = p->written_frames - playhead;
-    double base_delay = diff / (double)(ao->samplerate);
-    double delay = base_delay;
-    int java_latency_ms = -1;
-    if (!p->timestamp_set &&
-        p->format != AudioFormat.ENCODING_IEC61937) {
-        java_latency_ms = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency);
-        delay += (double)java_latency_ms / 1000.0;
-    }
-    int64_t fci_ts_frame = -1;
-    int64_t fci_ts_nano = -1;
-    if (p->timestamp_set) {
-        fci_ts_frame = 0xFFFFFFFFL &
-            MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
-        fci_ts_nano = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
-    }
-    double unclamped = delay;
-    bool rejected = delay > 2.0;
-    double result = rejected ? 0.0 : MPCLAMP(delay, 0.0, 2.0);
-    MP_INFO(ao,
-            "FCI_AT_LATENCY written=%u playhead=%u diff=%u base=%.9f "
-            "java_latency_ms=%d total_raw=%.9f result=%.9f rejected=%d "
-            "ts_before=%d ts_after=%d stable_before=%d stable_after=%d "
-            "fetched_before=%lld fetched_after=%lld ts_frame=%lld ts_nano=%lld "
-            "raw_playhead_before=%u raw_playhead_after=%u playhead_offset=%u "
-            "reset_pending=%d pending_bytes=%d raw_ns=%lld\\n",
-            p->written_frames, playhead, diff, base_delay, java_latency_ms,
-            unclamped, result, rejected, fci_ts_before, fci_ts_after,
-            fci_stable_before, p->timestamp_stable,
-            (long long)fci_fetched_before, (long long)p->timestamp_fetched,
-            (long long)fci_ts_frame, (long long)fci_ts_nano,
-            fci_raw_before, p->playhead_pos, p->playhead_offset,
-            p->reset_pending, p->pending_bytes, (long long)mp_raw_time_ns());
-    if (rejected) {
-        p->timestamp_fetched = 0;
-        return 0;
-    }
-    return result;'''
+    # Keep AudioTrack_getLatency() behavior byte-for-byte equivalent: do not
+    # make an extra Java getLatency() call and do not replace its return path.
+    # Snapshot state around the existing playback-head call, remember the base
+    # delay, then log the final raw delay immediately before its existing clamp.
     src = regex_in_function(
         src,
         "static double AudioTrack_getLatency(struct ao *ao)",
-        r'(?ms)^(?P<i>[ \t]*)uint32_t[ \t]+playhead[ \t]*=[ \t]*AudioTrack_getPlaybackHeadPosition\(ao\);[ \t]*\n(?P=i)uint32_t[ \t]+diff[ \t]*=[ \t]*p->written_frames[ \t]*-[ \t]*playhead;[ \t]*\n(?P=i)double[ \t]+delay[ \t]*=[ \t]*diff[ \t]*/[ \t]*\(double\)\(ao->samplerate\);[ \t]*\n(?P=i)if[ \t]*\(!p->timestamp_set[ \t]*&&[ \t]*\n[ \t]*p->format[ \t]*!=[ \t]*AudioFormat\.ENCODING_IEC61937\)[ \t]*\n[ \t]*delay[ \t]*\+=[ \t]*\(double\)MP_JNI_CALL_INT\(p->audiotrack,[ \t]*AudioTrack\.getLatency\)[ \t]*/[ \t]*1000\.0;[ \t]*\n(?P=i)if[ \t]*\(delay[ \t]*>[ \t]*2\.0\)[ \t]*\{.*?\n(?P=i)\}[ \t]*\n(?P=i)return[ \t]+MPCLAMP\(delay,[ \t]*0\.0,[ \t]*2\.0\);[ \t]*$',
-        lambda m: m.group('i') + latency_block,
-        "AudioTrack latency state",
+        r'(?m)^(?P<i>[ \t]*)uint32_t[ \t]+playhead[ \t]*=[ \t]*AudioTrack_getPlaybackHeadPosition\(ao\);[ \t]*$',
+        lambda m: (m.group('i') + 'bool fci_ts_before = p->timestamp_set;\n' +
+                   m.group('i') + 'int fci_stable_before = p->timestamp_stable;\n' +
+                   m.group('i') + 'int64_t fci_fetched_before = p->timestamp_fetched;\n' +
+                   m.group('i') + 'uint32_t fci_raw_before = p->playhead_pos;\n' +
+                   m.group(0) + '\n' +
+                   m.group('i') + 'bool fci_ts_after = p->timestamp_set;'),
+        "AudioTrack latency playhead",
+    )
+    src = regex_in_function(
+        src,
+        "static double AudioTrack_getLatency(struct ao *ao)",
+        r'(?m)^(?P<i>[ \t]*)double[ \t]+delay[ \t]*=[ \t]*diff[ \t]*/[ \t]*\(double\)\(?ao->samplerate\)?;[ \t]*$',
+        lambda m: m.group(0) + '\n' + m.group('i') + 'double fci_base_delay = delay;',
+        "AudioTrack latency base",
+    )
+    latency_log = r'''double fci_java_component = delay - fci_base_delay;
+    double fci_result = delay > 2.0 ? 0.0 : MPCLAMP(delay, 0.0, 2.0);
+    MP_INFO(ao,
+            "FCI_AT_LATENCY written=%u playhead=%u diff=%u base=%.9f "
+            "java_component=%.9f total_raw=%.9f result=%.9f "
+            "ts_before=%d ts_after=%d stable_before=%d stable_after=%d "
+            "fetched_before=%lld fetched_after=%lld raw_playhead_before=%u "
+            "raw_playhead_after=%u playhead_offset=%u reset_pending=%d "
+            "pending_bytes=%d raw_ns=%lld\n",
+            p->written_frames, playhead, diff, fci_base_delay,
+            fci_java_component, delay, fci_result, fci_ts_before, fci_ts_after,
+            fci_stable_before, p->timestamp_stable,
+            (long long)fci_fetched_before, (long long)p->timestamp_fetched,
+            fci_raw_before, p->playhead_pos, p->playhead_offset,
+            p->reset_pending, p->pending_bytes, (long long)mp_raw_time_ns());'''
+    src = regex_in_function(
+        src,
+        "static double AudioTrack_getLatency(struct ao *ao)",
+        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(delay[ \t]*>[ \t]*2\.0\)[ \t]*\{[ \t]*$',
+        lambda m: m.group('i') + latency_log + '\n' + m.group(0),
+        "AudioTrack latency final",
     )
 
 # set_pause() is introduced by the hardware-pause patch above, so its body is
