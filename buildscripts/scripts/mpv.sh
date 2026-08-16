@@ -323,6 +323,872 @@ src = src[:line_start] + new + src[end:]
 path.write_text(src)
 PY_OSD_VIEWPORT
 
+# Pause/resume frame-continuity instrumentation. Keep the production video
+# behavior intact: no seek, queue reset, PTS rebase, acquisition-policy change,
+# or resume gate is introduced here. The records join media PTS, VO frame IDs,
+# libplacebo selection, AImage timestamps, EGL swaps, and pause epochs.
+python3 - <<'PY_FCI_MPV'
+from pathlib import Path
+
+
+def replace_once(text, old, new, label):
+    if text.count(old) != 1:
+        raise SystemExit(f"mpv FCI instrumentation failed at {label}: "
+                         f"expected one anchor, found {text.count(old)}")
+    return text.replace(old, new, 1)
+
+
+def load(path):
+    p = Path(path)
+    return p, p.read_text()
+
+
+# Player/core: record filtered-decoder output and the exact image selected for VO.
+p, src = load("player/video.c")
+if "FCI_CORE_FRAME_READY" not in src:
+    src = replace_once(
+        src,
+        '''    mp_assert(mpctx->num_next_frames < MP_ARRAY_SIZE(mpctx->next_frames));
+    mp_assert(frame);
+    mpctx->next_frames[mpctx->num_next_frames++] = frame;
+''',
+        '''    mp_assert(mpctx->num_next_frames < MP_ARRAY_SIZE(mpctx->next_frames));
+    mp_assert(frame);
+    MP_INFO(mpctx,
+            "FCI_CORE_FRAME_READY image=%p media_pts=%.9f pkt_duration=%.9f mp_ns=%"PRId64"\\n",
+            frame, frame->pts, frame->pkt_duration, mp_time_ns());
+    mpctx->next_frames[mpctx->num_next_frames++] = frame;
+''',
+        "core decoded/filtered frame",
+    )
+    src = replace_once(
+        src,
+        '''    mpctx->last_frame_duration =
+        mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
+
+    shift_frames(mpctx);
+''',
+        '''    mpctx->last_frame_duration =
+        mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
+
+    MP_INFO(mpctx,
+            "FCI_CORE_SELECT image=%p media_pts=%.9f target_ns=%"PRId64
+            " paused=%d future=%d mp_ns=%"PRId64"\\n",
+            frame->current, mpctx->video_pts, frame->pts, mpctx->paused,
+            frame->num_frames, mp_time_ns());
+    shift_frames(mpctx);
+''',
+        "core VO selection",
+    )
+    p.write_text(src)
+
+
+# Player pause boundary: this is the authoritative effective mpv pause state,
+# distinct from a UI command being accepted by the Android frontend.
+p, src = load("player/playloop.c")
+if "FCI_CORE_PAUSE" not in src:
+    src = replace_once(
+        src,
+        '''#include "osdep/timer.h"
+''',
+        '''#include "osdep/timer.h"
+#include <libavutil/time.h>
+''',
+        "shared monotonic clock include",
+    )
+    src = replace_once(
+        src,
+        '''void set_pause_state(struct MPContext *mpctx, bool user_pause)
+{
+    struct MPOpts *opts = mpctx->opts;
+
+    opts->pause = user_pause;
+''',
+        '''void set_pause_state(struct MPContext *mpctx, bool user_pause)
+{
+    struct MPOpts *opts = mpctx->opts;
+    static uint64_t fci_pause_transition;
+
+    opts->pause = user_pause;
+''',
+        "pause transition counter",
+    )
+    src = replace_once(
+        src,
+        '''    if (internal_paused != mpctx->paused) {
+        mpctx->paused = internal_paused;
+
+        if (mpctx->ao) {
+''',
+        '''    if (internal_paused != mpctx->paused) {
+        mpctx->paused = internal_paused;
+        uint64_t fci_transition = ++fci_pause_transition;
+        MP_INFO(mpctx,
+                "FCI_CORE_PAUSE transition=%llu state=%s user=%d cache=%d video_pts=%.9f mp_ns=%lld mono_us=%lld\\n",
+                (unsigned long long)fci_transition,
+                internal_paused ? "PAUSE" : "RESUME", user_pause,
+                mpctx->paused_for_cache, mpctx->video_pts,
+                (long long)mp_time_ns(), (long long)av_gettime_relative());
+
+        if (mpctx->ao) {
+''',
+        "effective pause marker",
+    )
+    p.write_text(src)
+
+
+# VO scheduler: identify every queued and rendered frame, and expose whether a
+# pause transition arrived while draw/flip was already in flight.
+p, src = load("video/out/vo.c")
+if "FCI_VO_QUEUE" not in src:
+    src = replace_once(
+        src,
+        '''    uint64_t current_frame_id;
+
+    double display_fps;
+''',
+        '''    uint64_t current_frame_id;
+    uint64_t fci_epoch;
+    uint64_t fci_render_seq;
+
+    double display_fps;
+''',
+        "VO trace fields",
+    )
+    src = replace_once(
+        src,
+        '''    frame->frame_id = ++(in->current_frame_id);
+    in->frame_queued = frame;
+''',
+        '''    frame->frame_id = ++(in->current_frame_id);
+    MP_INFO(vo,
+            "FCI_VO_QUEUE epoch=%llu id=%llu media_pts=%.9f target_ns=%lld duration_ns=%.0f paused=%d mp_ns=%lld\\n",
+            (unsigned long long)in->fci_epoch,
+            (unsigned long long)frame->frame_id,
+            frame->current ? frame->current->pts : MP_NOPTS_VALUE,
+            (long long)frame->pts, frame->duration, in->paused,
+            (long long)mp_time_ns());
+    in->frame_queued = frame;
+''',
+        "VO queue marker",
+    )
+    src = replace_once(
+        src,
+        '''    struct vo_frame *frame = NULL;
+    bool more_frames = false;
+
+    update_display_fps(vo);
+''',
+        '''    struct vo_frame *frame = NULL;
+    bool more_frames = false;
+    uint64_t fci_render_seq = 0;
+    uint64_t fci_render_epoch = 0;
+    uint64_t fci_frame_id = 0;
+    double fci_media_pts = MP_NOPTS_VALUE;
+
+    update_display_fps(vo);
+''',
+        "VO render trace locals",
+    )
+    src = replace_once(
+        src,
+        '''    frame = vo_frame_ref(in->current_frame);
+    mp_assert(frame);
+
+    if (frame->display_synced) {
+''',
+        '''    frame = vo_frame_ref(in->current_frame);
+    mp_assert(frame);
+    fci_render_seq = ++in->fci_render_seq;
+    fci_render_epoch = in->fci_epoch;
+    fci_frame_id = frame->frame_id;
+    fci_media_pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
+    MP_INFO(vo,
+            "FCI_VO_RENDER_SELECT render_seq=%llu epoch=%llu id=%llu media_pts=%.9f target_ns=%lld paused=%d mp_ns=%lld\\n",
+            (unsigned long long)fci_render_seq,
+            (unsigned long long)fci_render_epoch,
+            (unsigned long long)fci_frame_id, fci_media_pts,
+            (long long)frame->pts, in->paused, (long long)mp_time_ns());
+
+    if (frame->display_synced) {
+''',
+        "VO render selection",
+    )
+    src = replace_once(
+        src,
+        '''    if (in->dropped_frame) {
+        in->drop_count += 1;
+        wakeup_core(vo);
+    } else {
+        in->rendering = true;
+''',
+        '''    if (in->dropped_frame) {
+        MP_INFO(vo,
+                "FCI_VO_DROP render_seq=%llu epoch=%llu id=%llu media_pts=%.9f mp_ns=%lld\\n",
+                (unsigned long long)fci_render_seq,
+                (unsigned long long)fci_render_epoch,
+                (unsigned long long)fci_frame_id, fci_media_pts,
+                (long long)mp_time_ns());
+        in->drop_count += 1;
+        wakeup_core(vo);
+    } else {
+        MP_INFO(vo,
+                "FCI_VO_DRAW_BEGIN render_seq=%llu epoch=%llu id=%llu media_pts=%.9f mp_ns=%lld\\n",
+                (unsigned long long)fci_render_seq,
+                (unsigned long long)fci_render_epoch,
+                (unsigned long long)fci_frame_id, fci_media_pts,
+                (long long)mp_time_ns());
+        in->rendering = true;
+''',
+        "VO draw/drop boundary",
+    )
+    src = replace_once(
+        src,
+        '''        in->visible = vo->driver->draw_frame(vo, frame);
+
+        stats_time_end(in->stats, "video-draw");
+
+        wait_until(vo, target);
+''',
+        '''        in->visible = vo->driver->draw_frame(vo, frame);
+
+        stats_time_end(in->stats, "video-draw");
+        MP_INFO(vo,
+                "FCI_VO_DRAW_END render_seq=%llu epoch=%llu id=%llu visible=%d mp_ns=%lld\\n",
+                (unsigned long long)fci_render_seq,
+                (unsigned long long)fci_render_epoch,
+                (unsigned long long)fci_frame_id, in->visible,
+                (long long)mp_time_ns());
+
+        wait_until(vo, target);
+''',
+        "VO draw completion",
+    )
+    src = replace_once(
+        src,
+        '''        stats_time_start(in->stats, "video-flip");
+
+        vo->driver->flip_page(vo);
+
+        struct vo_vsync_info vsync = {
+''',
+        '''        stats_time_start(in->stats, "video-flip");
+        MP_INFO(vo,
+                "FCI_VO_FLIP_BEGIN render_seq=%llu epoch=%llu id=%llu target_ns=%lld mp_ns=%lld\\n",
+                (unsigned long long)fci_render_seq,
+                (unsigned long long)fci_render_epoch,
+                (unsigned long long)fci_frame_id, (long long)target,
+                (long long)mp_time_ns());
+
+        vo->driver->flip_page(vo);
+        MP_INFO(vo,
+                "FCI_VO_FLIP_END render_seq=%llu epoch=%llu id=%llu mp_ns=%lld\\n",
+                (unsigned long long)fci_render_seq,
+                (unsigned long long)fci_render_epoch,
+                (unsigned long long)fci_frame_id, (long long)mp_time_ns());
+
+        struct vo_vsync_info vsync = {
+''',
+        "VO flip boundary",
+    )
+    src = replace_once(
+        src,
+        '''        mp_mutex_lock(&in->lock);
+        in->dropped_frame = prev_drop_count < vo->in->drop_count;
+        in->rendering = false;
+
+        update_vsync_timing_after_swap(vo, &vsync);
+''',
+        '''        mp_mutex_lock(&in->lock);
+        MP_INFO(vo,
+                "FCI_VO_RENDER_END render_seq=%llu start_epoch=%llu end_epoch=%llu id=%llu paused=%d mp_ns=%lld\\n",
+                (unsigned long long)fci_render_seq,
+                (unsigned long long)fci_render_epoch,
+                (unsigned long long)in->fci_epoch,
+                (unsigned long long)fci_frame_id, in->paused,
+                (long long)mp_time_ns());
+        in->dropped_frame = prev_drop_count < vo->in->drop_count;
+        in->rendering = false;
+
+        update_vsync_timing_after_swap(vo, &vsync);
+''',
+        "VO post-swap epoch check",
+    )
+    old_pause = '''void vo_set_paused(struct vo *vo, bool paused)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    if (in->paused != paused) {
+        in->paused = paused;
+        if (in->paused && in->dropped_frame) {
+            in->request_redraw = true;
+            wakeup_core(vo);
+        }
+        reset_vsync_timings(vo);
+        wakeup_locked(vo);
+    }
+    mp_mutex_unlock(&in->lock);
+}
+'''
+    new_pause = '''void vo_set_paused(struct vo *vo, bool paused)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    if (in->paused != paused) {
+        in->paused = paused;
+        in->fci_epoch++;
+        MP_INFO(vo,
+                "FCI_VO_PAUSE epoch=%llu state=%s rendering=%d current_id=%llu current_media_pts=%.9f queued_id=%llu queued_media_pts=%.9f mp_ns=%lld\\n",
+                (unsigned long long)in->fci_epoch, paused ? "PAUSE" : "RESUME",
+                in->rendering,
+                (unsigned long long)(in->current_frame ? in->current_frame->frame_id : 0),
+                in->current_frame && in->current_frame->current
+                    ? in->current_frame->current->pts : MP_NOPTS_VALUE,
+                (unsigned long long)(in->frame_queued ? in->frame_queued->frame_id : 0),
+                in->frame_queued && in->frame_queued->current
+                    ? in->frame_queued->current->pts : MP_NOPTS_VALUE,
+                (long long)mp_time_ns());
+        if (in->paused && in->dropped_frame) {
+            in->request_redraw = true;
+            wakeup_core(vo);
+        }
+        reset_vsync_timings(vo);
+        wakeup_locked(vo);
+    }
+    mp_mutex_unlock(&in->lock);
+}
+'''
+    src = replace_once(src, old_pause, new_pause, "VO pause state")
+    src = replace_once(
+        src,
+        '''void vo_seek_reset(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    forget_frames(vo);
+''',
+        '''void vo_seek_reset(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    in->fci_epoch++;
+    MP_INFO(vo, "FCI_VO_RESET epoch=%llu mp_ns=%lld\\n",
+            (unsigned long long)in->fci_epoch, (long long)mp_time_ns());
+    forget_frames(vo);
+''',
+        "VO reset generation",
+    )
+    p.write_text(src)
+
+
+# AImageReader mapper: preserve acquireLatestImage exactly, but expose callback
+# count, source PTS, acquired AImage timestamp, and hardware-buffer identity.
+p, src = load("video/out/hwdec/hwdec_aimagereader.c")
+if "FCI_AIMAGE_CALLBACK" not in src:
+    src = replace_once(
+        src,
+        '''    media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
+    void (*AImage_delete)(AImage *);
+''',
+        '''    media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
+    media_status_t (*AImage_getTimestamp)(const AImage *, int64_t *);
+    void (*AImage_delete)(AImage *);
+''',
+        "AImage timestamp function pointer",
+    )
+    src = replace_once(
+        src,
+        '''    bool image_available;
+
+    EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
+''',
+        '''    bool image_available;
+    uint64_t image_callback_seq;
+    uint64_t map_seq;
+    uint64_t current_map_seq;
+    int64_t current_image_ts_ns;
+    AHardwareBuffer *current_hwbuf;
+
+    EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
+''',
+        "AImage trace fields",
+    )
+    src = replace_once(
+        src,
+        '''    { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
+    { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
+''',
+        '''    { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
+    { "AImage_getTimestamp", offsetof(struct priv_owner, AImage_getTimestamp) },
+    { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
+''',
+        "AImage timestamp symbol",
+    )
+    old_cb = '''    mp_mutex_lock(&p->lock);
+    p->image_available = true;
+    mp_cond_signal(&p->cond);
+    mp_mutex_unlock(&p->lock);
+'''
+    new_cb = '''    mp_mutex_lock(&p->lock);
+    p->image_available = true;
+    uint64_t callback_seq = ++p->image_callback_seq;
+    mp_cond_signal(&p->cond);
+    mp_mutex_unlock(&p->lock);
+    mp_info(p->log, "FCI_AIMAGE_CALLBACK callback_seq=%llu mp_ns=%lld\\n",
+            (unsigned long long)callback_seq, (long long)mp_time_ns());
+'''
+    src = replace_once(src, old_cb, new_cb, "AImage callback")
+    src = replace_once(
+        src,
+        '''    if (p->image) {
+        o->AImage_delete(p->image);
+        p->image = NULL;
+    }
+''',
+        '''    if (p->image) {
+        MP_INFO(mapper,
+                "FCI_AIMAGE_UNMAP map_seq=%llu image=%p image_ts_ns=%lld hwbuf=%p mp_ns=%lld\\n",
+                (unsigned long long)p->current_map_seq, p->image,
+                (long long)p->current_image_ts_ns, p->current_hwbuf,
+                (long long)mp_time_ns());
+        o->AImage_delete(p->image);
+        p->image = NULL;
+        p->current_hwbuf = NULL;
+    }
+''',
+        "AImage unmap",
+    )
+    old_release = '''    {
+        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
+            return -1;
+        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
+        av_mediacodec_release_buffer(buffer, 1);
+    }
+'''
+    new_release = '''    uint64_t map_seq = ++p->map_seq;
+    {
+        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
+            return -1;
+        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
+        MP_INFO(mapper,
+                "FCI_AIMAGE_CODEC_RELEASE_BEGIN map_seq=%llu codec_buffer=%p source_media_pts=%.9f mp_ns=%lld\\n",
+                (unsigned long long)map_seq, buffer, mapper->src->pts,
+                (long long)mp_time_ns());
+        int release_ret = av_mediacodec_release_buffer(buffer, 1);
+        MP_INFO(mapper,
+                "FCI_AIMAGE_CODEC_RELEASE_END map_seq=%llu codec_buffer=%p result=%d mp_ns=%lld\\n",
+                (unsigned long long)map_seq, buffer, release_ret,
+                (long long)mp_time_ns());
+    }
+'''
+    src = replace_once(src, old_release, new_release, "MediaCodec-to-AImage release")
+    src = replace_once(
+        src,
+        '''    image_available = p->image_available;
+    p->image_available = false;
+    mp_mutex_unlock(&p->lock);
+
+    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
+''',
+        '''    image_available = p->image_available;
+    uint64_t callback_seq = p->image_callback_seq;
+    p->image_available = false;
+    mp_mutex_unlock(&p->lock);
+
+    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
+''',
+        "AImage callback snapshot",
+    )
+    src = replace_once(
+        src,
+        '''    mp_assert(p->image);
+
+    AHardwareBuffer *hwbuf = NULL;
+''',
+        '''    mp_assert(p->image);
+
+    int64_t image_ts_ns = -1;
+    media_status_t ts_ret = o->AImage_getTimestamp(p->image, &image_ts_ns);
+
+    AHardwareBuffer *hwbuf = NULL;
+''',
+        "AImage timestamp read",
+    )
+    src = replace_once(
+        src,
+        '''    AHardwareBuffer_Desc d;
+    o->AHardwareBuffer_describe(hwbuf, &d);
+    if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
+''',
+        '''    AHardwareBuffer_Desc d;
+    o->AHardwareBuffer_describe(hwbuf, &d);
+    p->current_map_seq = map_seq;
+    p->current_image_ts_ns = image_ts_ns;
+    p->current_hwbuf = hwbuf;
+    MP_INFO(mapper,
+            "FCI_AIMAGE_ACQUIRE map_seq=%llu callback_seq=%llu source_media_pts=%.9f image=%p image_ts_status=%d image_ts_ns=%lld hwbuf=%p width=%u height=%u layers=%u format=%u stride=%u mp_ns=%lld\\n",
+            (unsigned long long)map_seq, (unsigned long long)callback_seq,
+            mapper->src->pts, p->image, ts_ret, (long long)image_ts_ns,
+            hwbuf, d.width, d.height, d.layers, d.format, d.stride,
+            (long long)mp_time_ns());
+    if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
+''',
+        "AImage acquisition identity",
+    )
+    p.write_text(src)
+
+
+# gpu-next/libplacebo: record queue insertion, lazy mapping, selected mix, and
+# the frame associated with each output swap. No queue state is changed.
+p, src = load("video/out/vo_gpu_next.c")
+if "FCI_GPU_DRAW_BEGIN" not in src:
+    src = replace_once(
+        src,
+        '''    bool frame_pending;
+    bool paused;
+
+    pl_options pars;
+''',
+        '''    bool frame_pending;
+    bool paused;
+    uint64_t fci_draw_seq;
+    uint64_t fci_pending_draw_seq;
+    uint64_t fci_pending_frame_id;
+    double fci_pending_media_pts;
+    uint64_t fci_swap_seq;
+
+    pl_options pars;
+''',
+        "gpu-next trace fields",
+    )
+    src = replace_once(
+        src,
+        '''struct frame_priv {
+    struct vo *vo;
+    struct osd_state subs;
+''',
+        '''struct frame_priv {
+    struct vo *vo;
+    uint64_t frame_id;
+    struct osd_state subs;
+''',
+        "libplacebo source frame ID",
+    )
+    src = replace_once(
+        src,
+        '''    struct frame_priv *fp = mpi->priv;
+    struct priv *p = fp->vo->priv;
+    if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
+''',
+        '''    struct frame_priv *fp = mpi->priv;
+    struct priv *p = fp->vo->priv;
+    MP_INFO(fp->vo,
+            "FCI_GPU_HWACQUIRE_BEGIN id=%llu media_pts=%.9f mp_ns=%lld\\n",
+            (unsigned long long)fp->frame_id, mpi->pts,
+            (long long)mp_time_ns());
+    if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
+''',
+        "gpu hardware acquire begin",
+    )
+    src = replace_once(
+        src,
+        '''    p->hwdec_perf = timer_pool_measure(p->hwdec_timer);
+    stats_time_end(p->stats, "hwdec-map");
+
+    return true;
+''',
+        '''    p->hwdec_perf = timer_pool_measure(p->hwdec_timer);
+    stats_time_end(p->stats, "hwdec-map");
+    MP_INFO(fp->vo,
+            "FCI_GPU_HWACQUIRE_END id=%llu media_pts=%.9f mp_ns=%lld\\n",
+            (unsigned long long)fp->frame_id, mpi->pts,
+            (long long)mp_time_ns());
+
+    return true;
+''',
+        "gpu hardware acquire end",
+    )
+    src = replace_once(
+        src,
+        '''    struct vo *vo = fp->vo;
+    struct priv *p = vo->priv;
+
+    fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
+''',
+        '''    struct vo *vo = fp->vo;
+    struct priv *p = vo->priv;
+    MP_INFO(vo,
+            "FCI_PL_MAP id=%llu media_pts=%.9f image=%p mp_ns=%lld\\n",
+            (unsigned long long)fp->frame_id, mpi->pts, mpi,
+            (long long)mp_time_ns());
+
+    fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
+''',
+        "libplacebo lazy map",
+    )
+    src = replace_once(
+        src,
+        '''    pl_gpu gpu = p->gpu;
+    update_options(vo);
+
+    struct pl_render_params params = pars->params;
+''',
+        '''    pl_gpu gpu = p->gpu;
+    update_options(vo);
+    uint64_t fci_draw_seq = ++p->fci_draw_seq;
+    p->fci_pending_draw_seq = fci_draw_seq;
+    p->fci_pending_frame_id = frame->current ? frame->frame_id : 0;
+    p->fci_pending_media_pts = frame->current
+        ? frame->current->pts : MP_NOPTS_VALUE;
+    MP_INFO(vo,
+            "FCI_GPU_DRAW_BEGIN draw_seq=%llu id=%llu media_pts=%.9f num_frames=%d paused_driver=%d mp_ns=%lld\\n",
+            (unsigned long long)fci_draw_seq,
+            (unsigned long long)p->fci_pending_frame_id,
+            p->fci_pending_media_pts, frame->num_frames, p->paused,
+            (long long)mp_time_ns());
+
+    struct pl_render_params params = pars->params;
+''',
+        "gpu draw begin",
+    )
+    src = replace_once(
+        src,
+        '''        if (p->want_reset) {
+            pl_queue_reset(p->queue);
+            p->last_pts = 0.0;
+''',
+        '''        if (p->want_reset) {
+            MP_INFO(vo,
+                    "FCI_PL_QUEUE_RESET draw_seq=%llu incoming_id=%d incoming_pts=%.9f mp_ns=%lld\\n",
+                    (unsigned long long)fci_draw_seq, id, frame->frames[n]->pts,
+                    (long long)mp_time_ns());
+            pl_queue_reset(p->queue);
+            p->last_pts = 0.0;
+''',
+        "libplacebo queue reset",
+    )
+    src = replace_once(
+        src,
+        '''        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+        mpi->priv = fp;
+        fp->vo = vo;
+
+        pl_queue_push(p->queue, &(struct pl_source_frame) {
+''',
+        '''        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+        mpi->priv = fp;
+        fp->vo = vo;
+        fp->frame_id = id;
+        MP_INFO(vo,
+                "FCI_PL_PUSH draw_seq=%llu id=%d media_pts=%.9f image=%p mp_ns=%lld\\n",
+                (unsigned long long)fci_draw_seq, id, mpi->pts, mpi,
+                (long long)mp_time_ns());
+
+        pl_queue_push(p->queue, &(struct pl_source_frame) {
+''',
+        "libplacebo queue push",
+    )
+    src = replace_once(
+        src,
+        '''        case PL_QUEUE_OK:
+            break;
+        }
+
+        // Update source crop and overlays on all existing frames. We
+''',
+        '''        case PL_QUEUE_OK:
+            break;
+        }
+
+        for (int i = 0; i < mix.num_frames; i++) {
+            const struct pl_frame *selected = mix.frames[i];
+            struct mp_image *selected_mpi = selected->user_data;
+            struct frame_priv *selected_fp = selected_mpi->priv;
+            MP_INFO(vo,
+                    "FCI_PL_SELECT draw_seq=%llu slot=%d count=%d id=%llu media_pts=%.9f rel_time=%.6f signature=%llu mp_ns=%lld\\n",
+                    (unsigned long long)fci_draw_seq, i, mix.num_frames,
+                    (unsigned long long)selected_fp->frame_id,
+                    selected_mpi->pts, mix.timestamps ? mix.timestamps[i] : 0.0f,
+                    (unsigned long long)(mix.signatures ? mix.signatures[i] : 0),
+                    (long long)mp_time_ns());
+        }
+
+        // Update source crop and overlays on all existing frames. We
+''',
+        "libplacebo selected mix",
+    )
+    src = replace_once(
+        src,
+        '''done:
+    if (!valid) // clear with purple to indicate error
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+
+    pl_gpu_flush(gpu);
+''',
+        '''done:
+    if (!valid) // clear with purple to indicate error
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+
+    MP_INFO(vo,
+            "FCI_GPU_DRAW_END draw_seq=%llu id=%llu media_pts=%.9f valid=%d mp_ns=%lld\\n",
+            (unsigned long long)fci_draw_seq,
+            (unsigned long long)p->fci_pending_frame_id,
+            p->fci_pending_media_pts, valid, (long long)mp_time_ns());
+    pl_gpu_flush(gpu);
+''',
+        "gpu draw end",
+    )
+    old_flip = '''static void flip_page(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    struct ra_swapchain *sw = p->ra_ctx->swapchain;
+
+    if (p->frame_pending) {
+        if (!pl_swapchain_submit_frame(p->sw))
+            MP_ERR(vo, "Failed presenting frame!\\n");
+        p->frame_pending = false;
+    }
+
+    sw->fns->swap_buffers(sw);
+}
+'''
+    new_flip = '''static void flip_page(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    uint64_t swap_seq = ++p->fci_swap_seq;
+    bool submitted = true;
+
+    MP_INFO(vo,
+            "FCI_GPU_SWAP_BEGIN swap_seq=%llu draw_seq=%llu id=%llu media_pts=%.9f pending=%d mp_ns=%lld\\n",
+            (unsigned long long)swap_seq,
+            (unsigned long long)p->fci_pending_draw_seq,
+            (unsigned long long)p->fci_pending_frame_id,
+            p->fci_pending_media_pts, p->frame_pending,
+            (long long)mp_time_ns());
+    if (p->frame_pending) {
+        submitted = pl_swapchain_submit_frame(p->sw);
+        if (!submitted)
+            MP_ERR(vo, "Failed presenting frame!\\n");
+        p->frame_pending = false;
+    }
+
+    sw->fns->swap_buffers(sw);
+    MP_INFO(vo,
+            "FCI_GPU_SWAP_END swap_seq=%llu draw_seq=%llu id=%llu media_pts=%.9f submitted=%d mp_ns=%lld\\n",
+            (unsigned long long)swap_seq,
+            (unsigned long long)p->fci_pending_draw_seq,
+            (unsigned long long)p->fci_pending_frame_id,
+            p->fci_pending_media_pts, submitted, (long long)mp_time_ns());
+}
+'''
+    src = replace_once(src, old_flip, new_flip, "gpu swap")
+    src = replace_once(
+        src,
+        '''    case VOCTRL_PAUSE:
+        if (p->is_interpolated)
+            vo->want_redraw = true;
+        p->paused = true;
+        return VO_TRUE;
+    case VOCTRL_RESUME:
+        p->paused = false;
+        return VO_TRUE;
+''',
+        '''    case VOCTRL_PAUSE:
+        MP_INFO(vo,
+                "FCI_GPU_CONTROL state=PAUSE pending_draw_seq=%llu pending_id=%llu pending_pts=%.9f mp_ns=%lld\\n",
+                (unsigned long long)p->fci_pending_draw_seq,
+                (unsigned long long)p->fci_pending_frame_id,
+                p->fci_pending_media_pts, (long long)mp_time_ns());
+        if (p->is_interpolated)
+            vo->want_redraw = true;
+        p->paused = true;
+        return VO_TRUE;
+    case VOCTRL_RESUME:
+        MP_INFO(vo,
+                "FCI_GPU_CONTROL state=RESUME pending_draw_seq=%llu pending_id=%llu pending_pts=%.9f mp_ns=%lld\\n",
+                (unsigned long long)p->fci_pending_draw_seq,
+                (unsigned long long)p->fci_pending_frame_id,
+                p->fci_pending_media_pts, (long long)mp_time_ns());
+        p->paused = false;
+        return VO_TRUE;
+''',
+        "gpu pause control arrival",
+    )
+    src = replace_once(
+        src,
+        '''    case VOCTRL_RESET:
+        // Defer until the first new frame (unique ID) actually arrives
+        p->want_reset = true;
+        return VO_TRUE;
+''',
+        '''    case VOCTRL_RESET:
+        MP_INFO(vo, "FCI_GPU_RESET_REQUEST mp_ns=%lld\\n",
+                (long long)mp_time_ns());
+        // Defer until the first new frame (unique ID) actually arrives
+        p->want_reset = true;
+        return VO_TRUE;
+''',
+        "gpu reset request",
+    )
+    p.write_text(src)
+
+
+# Android EGL producer: record the actual eglSwapBuffers return. mpv does not
+# use EGL_ANDROID_presentation_time here, and this build intentionally does not
+# start using it because that would change scheduling behavior under test.
+p, src = load("video/out/opengl/context_android.c")
+if "FCI_EGL_SWAP" not in src:
+    src = replace_once(
+        src,
+        '''#include "common/common.h"
+#include "context.h"
+''',
+        '''#include "common/common.h"
+#include "osdep/timer.h"
+#include "context.h"
+''',
+        "Android EGL monotonic clock include",
+    )
+    src = replace_once(
+        src,
+        '''    EGLContext egl_context;
+    EGLSurface egl_surface;
+};
+''',
+        '''    EGLContext egl_context;
+    EGLSurface egl_surface;
+    uint64_t fci_swap_seq;
+};
+''',
+        "Android EGL swap counter",
+    )
+    src = replace_once(
+        src,
+        '''static void android_swap_buffers(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    eglSwapBuffers(p->egl_display, p->egl_surface);
+}
+''',
+        '''static void android_swap_buffers(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    uint64_t swap_seq = ++p->fci_swap_seq;
+    int64_t begin = mp_time_ns();
+    EGLBoolean ok = eglSwapBuffers(p->egl_display, p->egl_surface);
+    EGLint error = ok ? EGL_SUCCESS : eglGetError();
+    MP_INFO(ctx,
+            "FCI_EGL_SWAP swap_seq=%llu result=%d egl_error=0x%x presentation_ts=unset begin_mp_ns=%lld end_mp_ns=%lld\\n",
+            (unsigned long long)swap_seq, ok, error,
+            (long long)begin, (long long)mp_time_ns());
+}
+''',
+        "Android EGL swap",
+    )
+    p.write_text(src)
+PY_FCI_MPV
+
 unset CC CXX # meson wants these unset
 
 meson setup $build --cross-file "$prefix_dir"/crossfile.txt \
