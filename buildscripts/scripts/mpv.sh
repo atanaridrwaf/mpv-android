@@ -219,25 +219,27 @@ static int AudioTrack_Recreate(struct ao *ao)
 ''',
     'timestamp helper insertion')
 
-replace_once(
-'''    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
-    MP_JNI_EXCEPTION_LOG(ao);
-    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
-    return AudioTrack_New(ao);
-}
-static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
-''',
-'''    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
-    MP_JNI_EXCEPTION_LOG(ao);
-    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
-    AudioTrack_invalidate_timestamp(p);
+# Keep this function-scoped instead of matching the entire Recreate body.
+# Upstream may add harmless statements/spacing there; the repair must still
+# inject the exact same resume-clock reset immediately before recreation.
+func_start = s.find('static int AudioTrack_Recreate(struct ao *ao)\n{')
+func_end = s.find('\nstatic uint32_t AudioTrack_getPlaybackHeadPosition', func_start)
+if func_start < 0 or func_end < 0:
+    raise SystemExit('AudioTrack resume-clock patch: recreate timestamp reset: function boundary not found')
+
+func = s[func_start:func_end]
+return_stmt = '    return AudioTrack_New(ao);'
+if func.count(return_stmt) != 1:
+    raise SystemExit(
+        f'AudioTrack resume-clock patch: recreate timestamp reset: expected 1 recreate return, got {func.count(return_stmt)}')
+
+reset = '''    AudioTrack_invalidate_timestamp(p);
     p->timestamp_resume_pending = false;
     AudioTrack_clear_resume_timestamp_state(p);
-    return AudioTrack_New(ao);
-}
-static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
-''',
-    'recreate timestamp reset')
+'''
+if '    AudioTrack_clear_resume_timestamp_state(p);' not in func:
+    func = func.replace(return_stmt, reset + return_stmt, 1)
+    s = s[:func_start] + func + s[func_end:]
 
 replace_once(
 '''    int64_t now = mp_raw_time_ns();
