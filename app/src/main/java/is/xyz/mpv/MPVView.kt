@@ -495,7 +495,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     var paused: Boolean?
         get() = MPVLib.getPropertyBoolean("pause")
-        set(paused) = MPVLib.setPropertyBoolean("pause", paused!!)
+        set(paused) {
+            FrameContinuityTrace.pauseCommand("set", paused.toString())
+            MPVLib.setPropertyBoolean("pause", paused!!)
+        }
 
     var timePos: Double?
         get() = MPVLib.getPropertyDouble("time-pos/full")
@@ -602,7 +605,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     // Commands
 
-    fun cyclePause() = MPVLib.command(arrayOf("cycle", "pause"))
+    fun cyclePause() {
+        FrameContinuityTrace.pauseCommand("cycle", "toggle")
+        MPVLib.command(arrayOf("cycle", "pause"))
+    }
 
     private fun makeCurrentOptionFileLocal(name: String): Boolean {
         val current = MPVLib.getPropertyString(name) ?: return false
