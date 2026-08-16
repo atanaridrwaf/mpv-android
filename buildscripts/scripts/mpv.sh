@@ -183,6 +183,8 @@ replace_once(
     bool timestamp_resume_pending;
     bool timestamp_resume_rearming;
     bool timestamp_resume_sampled;
+    int32_t timestamp_resume_handoff_bias_frames;
+    bool timestamp_resume_handoff_bias_active;
 ''',
     'timestamp resume state')
 
@@ -212,6 +214,8 @@ static void AudioTrack_clear_resume_timestamp_state(struct priv *p)
     p->timestamp_resume_time_ns = 0;
     p->timestamp_resume_rearming = false;
     p->timestamp_resume_sampled = false;
+    p->timestamp_resume_handoff_bias_frames = 0;
+    p->timestamp_resume_handoff_bias_active = false;
 }
 
 static int AudioTrack_Recreate(struct ao *ao)
@@ -291,10 +295,48 @@ replace_once(
                 } else {
                     uint32_t advanced = fpos - p->timestamp_resume_frame;
                     if (advanced > 0 && time2 > p->timestamp_resume_time_ns) {
-                        p->timestamp_resume_rearming = false;
-                        p->timestamp_resume_sampled = false;
-                        MP_VERBOSE(ao, "resume: AudioTimestamp re-armed at frame=%u time=%"PRId64"\\n",
-                                   fpos, time2);
+                        // The fallback path and AudioTimestamp represent the same
+                        // audio clock through different Android APIs. Align the
+                        // first post-resume AudioTimestamp to the exact effective
+                        // position the fallback path was returning, so switching
+                        // clock sources cannot create a one-shot A/V jump.
+                        uint32_t ts_now = fpos;
+                        if (now > time2) {
+                            double elapsed = (double)(now - time2) / 1e9;
+                            ts_now += elapsed * ao->samplerate;
+                        }
+
+                        uint32_t playback_head = 0xFFFFFFFFL &
+                            MP_JNI_CALL_INT(p->audiotrack,
+                                            AudioTrack.getPlaybackHeadPosition);
+                        int latency_ms = MP_JNI_CALL_INT(p->audiotrack,
+                                                         AudioTrack.getLatency);
+                        if (latency_ms < 0)
+                            latency_ms = 0;
+                        uint32_t latency_frames =
+                            (uint32_t)((double)latency_ms * ao->samplerate / 1000.0);
+                        uint32_t fallback_effective = playback_head - latency_frames;
+                        int32_t bias = (int32_t)(fallback_effective - ts_now);
+
+                        // A valid handoff should never require a multi-second
+                        // correction. If Android still reports an incoherent
+                        // timestamp, keep using the continuous fallback clock and
+                        // poll again instead of accepting a destructive jump.
+                        int64_t max_bias = (int64_t)ao->samplerate * 2;
+                        if ((int64_t)bias > max_bias || (int64_t)bias < -max_bias) {
+                            p->timestamp_resume_frame = fpos;
+                            p->timestamp_resume_time_ns = time2;
+                            accept = false;
+                        } else {
+                            p->timestamp_resume_handoff_bias_frames = bias;
+                            p->timestamp_resume_handoff_bias_active = true;
+                            p->timestamp_resume_rearming = false;
+                            p->timestamp_resume_sampled = false;
+                            MP_VERBOSE(ao, "resume: AudioTimestamp handoff aligned bias=%d frames (%.3f ms)\\n",
+                                       bias, 1000.0 * bias / ao->samplerate);
+                            MP_VERBOSE(ao, "resume: AudioTimestamp re-armed at frame=%u time=%"PRId64"\\n",
+                                       fpos, time2);
+                        }
                     } else {
                         p->timestamp_resume_frame = fpos;
                         p->timestamp_resume_time_ns = time2;
@@ -326,6 +368,30 @@ replace_once(
         }
 ''',
     'timestamp reacquisition')
+
+# Apply the post-resume handoff bias inside the timestamp-position branch
+# without depending on the surrounding comment/spacing of upstream mpv.
+func_start = s.find('static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)\n{')
+func_end = s.find('\nstatic double AudioTrack_getLatency', func_start)
+if func_start < 0 or func_end < 0:
+    raise SystemExit('AudioTrack resume-clock patch: timestamp handoff continuity: function boundary not found')
+
+func = s[func_start:func_end]
+handoff_anchor = '''            pos += diff * ao->samplerate;
+        }
+'''
+handoff_code = '''            pos += diff * ao->samplerate;
+        }
+        if (p->timestamp_resume_handoff_bias_active)
+            pos = (uint32_t)((int64_t)pos +
+                             p->timestamp_resume_handoff_bias_frames);
+'''
+if 'p->timestamp_resume_handoff_bias_frames);' not in func:
+    if func.count(handoff_anchor) != 1:
+        raise SystemExit(
+            f'AudioTrack resume-clock patch: timestamp handoff continuity: expected 1 timestamp extrapolation anchor, got {func.count(handoff_anchor)}')
+    func = func.replace(handoff_anchor, handoff_code, 1)
+    s = s[:func_start] + func + s[func_end:]
 
 replace_once(
 '''    p->written_frames = 0;
