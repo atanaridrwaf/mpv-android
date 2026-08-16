@@ -196,6 +196,25 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     @Volatile
     private var playerSurfaceFrameSerial = 0L
 
+    // Normal mpv resume can release rendering and audio at the same instant. On this
+    // project's TextureView path that still leaves Android free to consume a short
+    // burst of frames before the first resumed frame is visibly composed. Prime
+    // exactly one video frame while hardware audio remains paused, wait until the
+    // TextureView confirms that frame, then release continuous playback.
+    private val resumeFrameGateHandler = Handler(Looper.getMainLooper())
+    private var resumeFrameGatePending = false
+    private var resumeFrameGateGeneration = 0L
+    private var resumeFrameGateFrameFloor = 0L
+    private var resumeFrameGateStartedAtMs = 0L
+    private var resumeFrameGateReleasePosted = false
+    private val resumeFrameGateTimeoutRunnable = Runnable {
+        if (!resumeFrameGatePending)
+            return@Runnable
+        val elapsed = SystemClock.uptimeMillis() - resumeFrameGateStartedAtMs
+        Log.w(TAG, "resume gate: no TextureView frame after ${elapsed}ms; resuming directly")
+        finishResumeFrameGate("timeout")
+    }
+
     private var suppressAspectMenuGeometrySyncUntilMs = 0L
 
     private val psc = Utils.PlaybackStateCache()
@@ -466,8 +485,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         zoomGestures = VideoZoomGestures(binding.player)
         binding.player.onSurfaceTextureFrameAvailable = {
             playerSurfaceFrameSerial += 1L
-            onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
+            val serial = playerSurfaceFrameSerial
+            onScrubSurfaceFrameAvailable(serial)
             zoomGestures.onSurfaceTextureFrameAvailable()
+            onResumeGateSurfaceFrameAvailable(serial)
         }
 
         readAutoRotationModeForLaunch()
@@ -798,6 +819,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     private fun onPauseImpl() {
+        cancelResumeFrameGate("activity-pause", keepPaused = true)
         val shouldBackground = shouldBackground()
         if (shouldBackground)
             BackgroundPlaybackService.grabThumbnail()
@@ -1697,10 +1719,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             KeyEvent.KEYCODE_INFO -> toggleControls()
             KeyEvent.KEYCODE_MENU -> openTopMenu()
             KeyEvent.KEYCODE_GUIDE -> openTopMenu()
-            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> player.cyclePause()
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> togglePlaybackPauseFromUi()
+            KeyEvent.KEYCODE_MEDIA_PLAY -> resumePlaybackWithFrameGate("media-key")
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> pausePlaybackImmediately("media-key")
 
             // (overrides a default binding)
-            KeyEvent.KEYCODE_ENTER -> player.cyclePause()
+            KeyEvent.KEYCODE_ENTER -> togglePlaybackPauseFromUi()
 
             else -> unhandled++
         }
@@ -3731,10 +3756,13 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPause() {
-            player.paused = true
+            pausePlaybackImmediately("media-session")
         }
         override fun onPlay() {
-            player.paused = false
+            if (activityIsForeground)
+                resumePlaybackWithFrameGate("media-session")
+            else
+                player.paused = false
         }
         override fun onSeekTo(pos: Long) {
             player.timePos = (pos / 1000.0)
@@ -3788,7 +3816,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         when (property) {
             // During scrub mpv is intentionally paused, but the controls represent the user's
             // desired state after the authoritative seek finishes.
-            "pause" -> updatePlaybackStatus(scrubPlaybackPaused ?: value)
+            "pause" -> updatePlaybackStatus(
+                if (resumeFrameGatePending) true else (scrubPlaybackPaused ?: value)
+            )
             "mute" -> { // indirectly from updateAudioPresence()
                 updateAudioUI()
             }
@@ -4098,6 +4128,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
     // --- Scrub seek helpers ---
     private fun resetScrubSeekControllerForFileChange() {
+        cancelResumeFrameGate("file-change", keepPaused = false)
         val desiredPlaybackPaused = scrubPlaybackPaused
         invalidateGestureStableTargetCheck()
         invalidateSeekbarStableTargetCheck()
@@ -4127,6 +4158,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         if (scrubPlaybackPaused != null)
             return
 
+        cancelResumeFrameGate("scrub-begin", keepPaused = true)
         val wasPaused = psc.pause
         scrubPlaybackPaused = wasPaused
         updatePlaybackStatus(wasPaused)
@@ -4145,16 +4177,142 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         updatePlaybackStatus(playbackPaused)
     }
 
+    private fun pausePlaybackImmediately(source: String) {
+        cancelResumeFrameGate("pause:$source", keepPaused = true)
+        player.paused = true
+        Log.v(TAG, "pause gate: paused from $source at surfaceSerial=$playerSurfaceFrameSerial")
+    }
+
+    private fun hasSteppableVideoForResume(): Boolean {
+        if (player.getVideoPixelSize() == null)
+            return false
+        val image = MPVLib.getPropertyString("current-tracks/video/image")
+        return image != "yes"
+    }
+
+    private fun resumePlaybackWithFrameGate(source: String) {
+        if (resumeFrameGatePending)
+            return
+
+        // Audio-only/static-image playback has no next TextureView video frame to wait for.
+        // The successful AudioTrack hardware-pause path can resume it directly.
+        if (!hasSteppableVideoForResume()) {
+            Log.v(TAG, "resume gate: $source has no steppable video; resuming directly")
+            player.paused = false
+            return
+        }
+
+        // Keep the user's paused state established first. The mpv-android-only
+        // frame-step video-only mode then lets the video core render exactly one
+        // frame while AO/AudioTrack remains hardware-paused. Unlike frame-step
+        // mute, no audio samples are consumed during this priming frame.
+        player.paused = true
+        val generation = ++resumeFrameGateGeneration
+        resumeFrameGatePending = true
+        resumeFrameGateReleasePosted = false
+        resumeFrameGateFrameFloor = playerSurfaceFrameSerial
+        resumeFrameGateStartedAtMs = SystemClock.uptimeMillis()
+        Log.v(TAG,
+            "resume gate: priming one video-only frame from $source " +
+            "generation=$generation floor=$resumeFrameGateFrameFloor time=${player.timePos}")
+
+        try {
+            MPVLib.command(arrayOf("frame-step", "1", "video-only"))
+        } catch (error: Throwable) {
+            Log.e(TAG, "resume gate: video-only frame-step failed; resuming directly", error)
+            finishResumeFrameGate("frame-step-error")
+            return
+        }
+        resumeFrameGateHandler.removeCallbacks(resumeFrameGateTimeoutRunnable)
+        resumeFrameGateHandler.postDelayed(
+            resumeFrameGateTimeoutRunnable,
+            RESUME_FRAME_GATE_TIMEOUT_MS
+        )
+    }
+
+    private fun onResumeGateSurfaceFrameAvailable(serial: Long) {
+        if (!resumeFrameGatePending || resumeFrameGateReleasePosted ||
+            serial <= resumeFrameGateFrameFloor)
+            return
+
+        resumeFrameGateReleasePosted = true
+        val generation = resumeFrameGateGeneration
+        val elapsed = SystemClock.uptimeMillis() - resumeFrameGateStartedAtMs
+        Log.v(TAG,
+            "resume gate: primed frame reached TextureView serial=$serial " +
+            "generation=$generation after ${elapsed}ms")
+
+        // onSurfaceTextureUpdated means Android has latched the new texture into
+        // this TextureView. Defer one UI animation turn before releasing continuous
+        // playback, and guard the callback so a cancelled old gate cannot release a
+        // newer one.
+        player.postOnAnimation {
+            if (resumeFrameGatePending && generation == resumeFrameGateGeneration)
+                finishResumeFrameGate("texture-visible")
+        }
+    }
+
+    private fun finishResumeFrameGate(reason: String) {
+        if (!resumeFrameGatePending)
+            return
+        val generation = resumeFrameGateGeneration
+        resumeFrameGatePending = false
+        resumeFrameGateReleasePosted = false
+        resumeFrameGateHandler.removeCallbacks(resumeFrameGateTimeoutRunnable)
+        val elapsed = SystemClock.uptimeMillis() - resumeFrameGateStartedAtMs
+        Log.v(TAG,
+            "resume gate: releasing playback reason=$reason generation=$generation " +
+            "elapsed=${elapsed}ms surfaceSerial=$playerSurfaceFrameSerial")
+
+        // If the timeout fired while the one-frame step was still running, forcing
+        // pause first cancels step_frames and clears mpv's audio-hold flag. If the
+        // step already completed this is a harmless no-op. The following unpause is
+        // therefore always a clean synchronized audio+video resume.
+        player.paused = true
+        player.paused = false
+        resumeFrameGateGeneration += 1L
+    }
+
+    private fun cancelResumeFrameGate(reason: String, keepPaused: Boolean) {
+        if (!resumeFrameGatePending)
+            return
+        val generation = resumeFrameGateGeneration
+        resumeFrameGatePending = false
+        resumeFrameGateReleasePosted = false
+        resumeFrameGateHandler.removeCallbacks(resumeFrameGateTimeoutRunnable)
+        resumeFrameGateGeneration += 1L
+        Log.v(TAG, "resume gate: cancelled reason=$reason generation=$generation")
+
+        // Also terminates an in-flight video-only frame-step and releases its
+        // audio-hold state inside mpv. keepPaused=true is the normal cancellation
+        // path (second toggle, activity pause, scrub).
+        player.paused = true
+        if (!keepPaused)
+            player.paused = false
+    }
+
     private fun togglePlaybackPauseFromUi() {
         val playbackPaused = scrubPlaybackPaused
         if (playbackPaused == null) {
-            player.cyclePause()
+            // If a second toggle arrives while the one-frame resume prime is in progress,
+            // interpret it as Pause rather than allowing two overlapping frame-step commands.
+            if (resumeFrameGatePending) {
+                cancelResumeFrameGate("second-toggle", keepPaused = true)
+                return
+            }
+
+            val isPaused = player.paused ?: psc.pause
+            if (isPaused)
+                resumePlaybackWithFrameGate("ui")
+            else
+                pausePlaybackImmediately("ui")
             return
         }
 
         // Record the user's desired post-seek state, but keep mpv physically paused until the
         // newest exact seek has produced its frame. Decoding while playback runs makes heavy
         // long-GOP HEVC seeks slower and can briefly expose an intermediate frame.
+        cancelResumeFrameGate("scrub-toggle", keepPaused = true)
         val newPlaybackPaused = !playbackPaused
         scrubPlaybackPaused = newPlaybackPaused
         player.paused = true
@@ -4791,6 +4949,9 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val SCRUB_TARGET_NEAR_TOLERANCE_SEC = 0.75
         private const val SCRUB_FRAME_GRACE_MS = 350L
         private const val SCRUB_SEEK_HARD_TIMEOUT_MS = 45_000L
+        // One frame should normally arrive in 16-42 ms. This only catches EOF,
+        // decoder stalls, or a surface that disappeared during the resume prime.
+        private const val RESUME_FRAME_GATE_TIMEOUT_MS = 500L
         private const val KEYFRAME_DIRECTION_EPSILON_SEC = 0.001
 
         // Per-file subtitle persistence keys
