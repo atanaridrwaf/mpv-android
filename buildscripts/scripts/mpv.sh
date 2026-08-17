@@ -327,19 +327,14 @@ if "ao_read_data_with_start_time" not in src:
     p.write_text(src)
 PY_AUDIO_CLOCK_CONTINUITY
 
-# Diagnostic-only PCM continuity audit for the custom AudioTrack pause path.
-# This deliberately changes no playback decisions. It assigns each PCM pull a
-# stable epoch/block identity, logs every blocking AudioTrack.write() attempt,
-# tracks partial-write offsets across pause/resume, and maintains independent
-# rolling hashes for bytes pulled from mpv and bytes accepted by AudioTrack.
-#
-# Expected invariant inside one epoch (outside an in-progress write error):
-#   pulled_bytes == accepted_bytes + outstanding_bytes + error_drop_bytes
-# When outstanding_bytes reaches zero and error_drop_bytes is zero, equal
-# rolling hashes prove byte-for-byte, in-order delivery from ao_read_data() to
-# successful AudioTrack.write() calls. reset/seek starts a new epoch and logs
-# any software-pending tail that is deliberately discarded by that reset.
-python3 - <<'PY_FCI_PCM_AUDIT'
+# Preserve v2's hard PCM-clock continuity, then add a deliberately conservative
+# long-term rate servo. This is rate-only: fixed AudioTrack phase offsets are
+# never corrected, and a live timeline is never hard-reanchored. The observer
+# must see a smooth trend for 30 seconds before it can change the rate; every
+# pause/resume/reset or timestamp/latency discontinuity discards its training.
+# Even after qualification, correction is capped at 500 ppm and 100 us per
+# audio pull, so it cannot create the multi-frame deadline jumps fixed by v2.
+python3 - <<'PY_AUDIO_LONG_TERM_DRIFT'
 from pathlib import Path
 import re
 
@@ -347,12 +342,12 @@ import re
 def function_span(text, signature, label):
     starts = [m.start() for m in re.finditer(re.escape(signature), text)]
     if len(starts) != 1:
-        raise SystemExit(f"PCM audit instrumentation failed at {label}: "
+        raise SystemExit(f"AudioTrack drift servo failed at {label}: "
                          f"expected one function signature, found {len(starts)}")
     start = starts[0]
     brace = text.find("{", start + len(signature))
     if brace < 0:
-        raise SystemExit(f"PCM audit instrumentation failed at {label}: opening brace not found")
+        raise SystemExit(f"AudioTrack drift servo failed at {label}: opening brace not found")
     depth = 0
     for i in range(brace, len(text)):
         if text[i] == "{":
@@ -361,14 +356,29 @@ def function_span(text, signature, label):
             depth -= 1
             if depth == 0:
                 return start, i + 1
-    raise SystemExit(f"PCM audit instrumentation failed at {label}: closing brace not found")
+    raise SystemExit(f"AudioTrack drift servo failed at {label}: closing brace not found")
+
+
+def block_span(text, start, label):
+    brace = text.find("{", start)
+    if brace < 0:
+        raise SystemExit(f"AudioTrack drift servo failed at {label}: opening brace not found")
+    depth = 0
+    for i in range(brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    raise SystemExit(f"AudioTrack drift servo failed at {label}: closing brace not found")
 
 
 def regex_once(text, pattern, repl, label, flags=0):
     rx = re.compile(pattern, flags)
     matches = list(rx.finditer(text))
     if len(matches) != 1:
-        raise SystemExit(f"PCM audit instrumentation failed at {label}: "
+        raise SystemExit(f"AudioTrack drift servo failed at {label}: "
                          f"expected one anchor, found {len(matches)}")
     return rx.sub(repl, text, count=1)
 
@@ -380,332 +390,234 @@ def regex_in_function(text, signature, pattern, repl, label, flags=0):
     return text[:start] + fn + text[end:]
 
 
-p = Path("audio/out/ao_audiotrack.c")
+p = Path("audio/out/buffer.c")
 src = p.read_text()
-if "FCI_PCM_PULL" not in src:
-    # All fields are owned by ao_thread except during stop(), which first pauses
-    # AudioTrack and then takes p->lock, so these diagnostics introduce no new
-    # cross-thread state reads in set_pause().
-    fields = r'''    uint64_t fci_pcm_epoch;
-    uint64_t fci_pcm_block_seq;
-    uint64_t fci_pcm_pulled_bytes;
-    uint64_t fci_pcm_accepted_bytes;
-    uint64_t fci_pcm_error_drop_bytes;
-    uint64_t fci_pcm_pull_hash;
-    uint64_t fci_pcm_write_hash;
-    uint64_t fci_pcm_block_hash;
-    int fci_pcm_block_bytes;
-    int fci_pcm_block_offset;
-    bool fci_pcm_block_active;
-    int fci_pcm_last_state;'''
+if "contiguous_drift_rate_ppb" not in src:
+    if "ao_read_data_with_start_time" not in src or "FCI_AO_ENDTIME_UPDATE" not in src:
+        raise SystemExit("AudioTrack drift servo requires the v2 contiguous timeline patch")
+
     src = regex_once(
         src,
-        r'(?m)^(?P<i>[ \t]*)int pending_bytes;[ \t]*$',
-        lambda m: m.group(0) + '\n' + fields,
-        "AudioTrack audit fields",
+        r'(?m)^(?P<i>[ \t]*)int64_t end_time_ns; // absolute output time of last played sample[ \t]*$',
+        lambda m: m.group(0) + '\n' +
+            m.group('i') + 'bool contiguous_drift_tracking;\n' +
+            m.group('i') + 'int contiguous_drift_good_samples;\n' +
+            m.group('i') + 'int64_t contiguous_drift_anchor_now_ns;\n' +
+            m.group('i') + 'int64_t contiguous_drift_anchor_phase_ns;\n' +
+            m.group('i') + 'int64_t contiguous_drift_prev_now_ns;\n' +
+            m.group('i') + 'int64_t contiguous_drift_prev_phase_ns;\n' +
+            m.group('i') + 'int64_t contiguous_drift_rate_ppb;',
+        "buffer drift state",
     )
 
     helper = r'''
-#define FCI_PCM_FNV_OFFSET 14695981039346656037ULL
-#define FCI_PCM_FNV_PRIME 1099511628211ULL
 
-static uint64_t fci_pcm_hash_update(uint64_t hash, const void *data, int len)
+static void reset_contiguous_clock_drift(struct buffer_state *p)
 {
-    const unsigned char *p = data;
-    for (int n = 0; n < len; n++) {
-        hash ^= p[n];
-        hash *= FCI_PCM_FNV_PRIME;
-    }
-    return hash;
-}
-
-static int64_t fci_pcm_invariant_delta(struct priv *p)
-{
-    int outstanding = p->fci_pcm_block_active
-                    ? p->fci_pcm_block_bytes - p->fci_pcm_block_offset : 0;
-    return (int64_t)p->fci_pcm_pulled_bytes
-         - (int64_t)p->fci_pcm_accepted_bytes
-         - (int64_t)p->fci_pcm_error_drop_bytes
-         - outstanding;
+    p->contiguous_drift_tracking = false;
+    p->contiguous_drift_good_samples = 0;
+    p->contiguous_drift_anchor_now_ns = 0;
+    p->contiguous_drift_anchor_phase_ns = 0;
+    p->contiguous_drift_prev_now_ns = 0;
+    p->contiguous_drift_prev_phase_ns = 0;
+    p->contiguous_drift_rate_ppb = 0;
 }
 '''
     src = regex_once(
         src,
-        r'(?m)^static MP_THREAD_VOID ao_thread\(void \*arg\)',
-        helper + '\nstatic MP_THREAD_VOID ao_thread(void *arg)',
-        "PCM audit helpers",
+        r'(?m)^};\n\nstatic MP_THREAD_VOID ao_thread\(void \*arg\);$',
+        lambda m: '};' + helper + '\nstatic MP_THREAD_VOID ao_thread(void *arg);',
+        "drift reset helper",
     )
 
-    thread_state_log = r'''if (state != p->fci_pcm_last_state) {
-                int fci_outstanding = p->fci_pcm_block_active
-                    ? p->fci_pcm_block_bytes - p->fci_pcm_block_offset : 0;
-                int fci_hash_match = -1;
-                if (fci_outstanding == 0 && p->fci_pcm_error_drop_bytes == 0 &&
-                    p->fci_pcm_epoch != 0)
-                    fci_hash_match = p->fci_pcm_pull_hash == p->fci_pcm_write_hash;
-                MP_INFO(ao,
-                        "FCI_PCM_THREAD_STATE state=%d prev_state=%d epoch=%llu "
-                        "block=%llu block_active=%d offset_bytes=%d block_bytes=%d "
-                        "outstanding_bytes=%d pending_bytes=%d pulled_bytes=%llu "
-                        "accepted_bytes=%llu error_drop_bytes=%llu "
-                        "stream_hash_match=%d invariant_delta=%lld raw_ns=%lld\n",
-                        state, p->fci_pcm_last_state,
-                        (unsigned long long)p->fci_pcm_epoch,
-                        (unsigned long long)p->fci_pcm_block_seq,
-                        p->fci_pcm_block_active, p->fci_pcm_block_offset,
-                        p->fci_pcm_block_bytes, fci_outstanding, p->pending_bytes,
-                        (unsigned long long)p->fci_pcm_pulled_bytes,
-                        (unsigned long long)p->fci_pcm_accepted_bytes,
-                        (unsigned long long)p->fci_pcm_error_drop_bytes,
-                        fci_hash_match, (long long)fci_pcm_invariant_delta(p),
-                        (long long)mp_raw_time_ns());
-                p->fci_pcm_last_state = state;
-            }'''
     src = regex_in_function(
         src,
-        "static MP_THREAD_VOID ao_thread(void *arg)",
-        r'(?m)^(?P<i>[ \t]*)state = MP_JNI_CALL_INT\(p->audiotrack, AudioTrack.getPlayState\);[ \t]*$',
-        lambda m: m.group(0) + '\n' + m.group('i') + thread_state_log,
-        "PCM thread play-state transition",
+        "void ao_set_paused(struct ao *ao, bool paused, bool eof)",
+        r'(?m)^(?P<i>[ \t]*)p->paused = paused;[ \t]*$',
+        lambda m: m.group('i') + 'if (p->paused != paused)\n' +
+                  m.group('i') + '    reset_contiguous_clock_drift(p);\n' +
+                  m.group('i') + 'p->paused = paused;',
+        "pause/resume observer reset",
     )
 
-    pull_log = r'''if (!p->fci_pcm_epoch) {
-                    p->fci_pcm_epoch = 1;
-                    p->fci_pcm_pull_hash = FCI_PCM_FNV_OFFSET;
-                    p->fci_pcm_write_hash = FCI_PCM_FNV_OFFSET;
-                }
-
-                if (bytes > 0) {
-                    int old_outstanding = p->fci_pcm_block_active
-                        ? p->fci_pcm_block_bytes - p->fci_pcm_block_offset : 0;
-                    if (old_outstanding != 0) {
-                        MP_ERR(ao,
-                               "FCI_PCM_INVARIANT status=BAD reason=new_pull_with_outstanding "
-                               "epoch=%llu block=%llu outstanding=%d pending_bytes=%d raw_ns=%lld\n",
-                               (unsigned long long)p->fci_pcm_epoch,
-                               (unsigned long long)p->fci_pcm_block_seq,
-                               old_outstanding, p->pending_bytes,
-                               (long long)mp_raw_time_ns());
-                    }
-                    p->fci_pcm_block_seq++;
-                    p->fci_pcm_block_bytes = bytes;
-                    p->fci_pcm_block_offset = 0;
-                    p->fci_pcm_block_active = true;
-                    p->fci_pcm_block_hash =
-                        fci_pcm_hash_update(FCI_PCM_FNV_OFFSET, p->chunk, bytes);
-                    p->fci_pcm_pull_hash =
-                        fci_pcm_hash_update(p->fci_pcm_pull_hash, p->chunk, bytes);
-                    p->fci_pcm_pulled_bytes += bytes;
-                }
-
-                MP_INFO(ao,
-                        "FCI_PCM_PULL epoch=%llu block=%llu requested_samples=%d "
-                        "returned_samples=%d stride=%d bytes=%d block_hash=%016llx "
-                        "pulled_bytes=%llu accepted_bytes=%llu error_drop_bytes=%llu "
-                        "outstanding_bytes=%d pending_bytes=%d invariant_delta=%lld raw_ns=%lld\n",
-                        (unsigned long long)p->fci_pcm_epoch,
-                        (unsigned long long)(bytes > 0 ? p->fci_pcm_block_seq : 0),
-                        read_samples, samples, ao->sstride, bytes,
-                        (unsigned long long)(bytes > 0 ? p->fci_pcm_block_hash : 0),
-                        (unsigned long long)p->fci_pcm_pulled_bytes,
-                        (unsigned long long)p->fci_pcm_accepted_bytes,
-                        (unsigned long long)p->fci_pcm_error_drop_bytes,
-                        p->fci_pcm_block_active
-                            ? p->fci_pcm_block_bytes - p->fci_pcm_block_offset : 0,
-                        p->pending_bytes, (long long)fci_pcm_invariant_delta(p),
-                        (long long)mp_raw_time_ns());'''
     src = regex_in_function(
         src,
-        "static MP_THREAD_VOID ao_thread(void *arg)",
-        r'(?m)^(?P<i>[ \t]*)bytes = samples \* ao->sstride;[ \t]*$',
-        lambda m: m.group(0) + '\n' + m.group('i') + pull_log,
-        "PCM pull accounting",
+        "void ao_reset(struct ao *ao)",
+        r'(?m)^(?P<i>[ \t]*)p->end_time_ns = 0;[ \t]*$',
+        lambda m: m.group('i') + 'p->end_time_ns = 0;\n' +
+                  m.group('i') + 'reset_contiguous_clock_drift(p);',
+        "reset observer state",
     )
 
-    write_begin = r'''int fci_pending_before = p->pending_bytes;
-            int fci_offset_before = p->fci_pcm_block_offset;
-            int fci_outstanding_before = p->fci_pcm_block_active
-                ? p->fci_pcm_block_bytes - p->fci_pcm_block_offset : 0;
-            uint64_t fci_segment_hash = bytes > 0
-                ? fci_pcm_hash_update(FCI_PCM_FNV_OFFSET, p->chunk, bytes) : 0;
-            if (bytes > 0) {
-                const char *fci_source = fci_pending_before > 0 ? "pending" : "new";
-                if (!p->fci_pcm_block_active || fci_outstanding_before != bytes) {
-                    MP_ERR(ao,
-                           "FCI_PCM_INVARIANT status=BAD reason=write_shape "
-                           "epoch=%llu block=%llu active=%d offset=%d block_bytes=%d "
-                           "request_bytes=%d outstanding=%d pending_before=%d raw_ns=%lld\n",
-                           (unsigned long long)p->fci_pcm_epoch,
-                           (unsigned long long)p->fci_pcm_block_seq,
-                           p->fci_pcm_block_active, p->fci_pcm_block_offset,
-                           p->fci_pcm_block_bytes, bytes, fci_outstanding_before,
-                           fci_pending_before, (long long)mp_raw_time_ns());
-                }
-                MP_INFO(ao,
-                        "FCI_PCM_WRITE_BEGIN epoch=%llu block=%llu source=%s "
-                        "offset_bytes=%d request_bytes=%d outstanding_bytes=%d "
-                        "pending_before=%d block_hash=%016llx segment_hash=%016llx "
-                        "raw_ns=%lld\n",
-                        (unsigned long long)p->fci_pcm_epoch,
-                        (unsigned long long)p->fci_pcm_block_seq, fci_source,
-                        fci_offset_before, bytes, fci_outstanding_before,
-                        fci_pending_before, (unsigned long long)p->fci_pcm_block_hash,
-                        (unsigned long long)fci_segment_hash,
-                        (long long)mp_raw_time_ns());
+    fn_start, fn_end = function_span(
+        src,
+        "static int ao_read_data_locked(struct ao *ao, void **data, int samples,",
+        "contiguous end-time function",
+    )
+    fn = src[fn_start:fn_end]
+    if "bool keep_contiguous" not in fn or "FCI_AO_ENDTIME_UPDATE" not in fn:
+        raise SystemExit("AudioTrack drift servo: v2 end-time function shape not found")
+    if_start = fn.find("if (pos > 0) {")
+    if if_start < 0:
+        raise SystemExit("AudioTrack drift servo: pos>0 block not found")
+    old_start, old_end = block_span(fn, if_start, "v2 end-time block")
+
+    endtime_block = r'''if (pos > 0) {
+        int64_t old_end = p->end_time_ns;
+        int64_t now = mp_time_ns();
+        int64_t duration_ns = MP_TIME_S_TO_NS(pos / (double)ao->samplerate);
+        int64_t measured_end = out_time_ns + (out_time_is_start ? duration_ns : 0);
+        int64_t predicted_end = old_end > 0 ? old_end + duration_ns : measured_end;
+        int64_t new_end = measured_end;
+        int64_t phase_error = measured_end - predicted_end;
+        int64_t slew_ns = 0;
+        const char *mode = "measured";
+        const char *drift_state = "off";
+
+        if (keep_contiguous && old_end > 0 && predicted_end >= now) {
+            mode = "contiguous";
+
+            // The measured phase itself is not trusted as an absolute target.
+            // Only its slow slope can train the servo.
+            const int64_t drift_jump_ns = 20 * 1000 * 1000LL;
+            const int64_t drift_gap_ns = 1000 * 1000 * 1000LL;
+            const int64_t drift_window_ns = 30LL * 1000 * 1000 * 1000;
+            const int64_t drift_min_delta_ns = 200 * 1000LL;
+            const int64_t drift_max_observed_ppb = 2LL * 1000 * 1000;
+            const int64_t drift_max_rate_ppb = 500 * 1000LL;
+            const int64_t drift_max_rate_step_ppb = 125 * 1000LL;
+            const int64_t drift_deadband_ppb = 5 * 1000LL;
+
+            bool reset_observer = false;
+            if (p->contiguous_drift_tracking) {
+                int64_t sample_dt = now - p->contiguous_drift_prev_now_ns;
+                int64_t phase_step = phase_error - p->contiguous_drift_prev_phase_ns;
+                int64_t abs_phase_step = phase_step < 0 ? -phase_step : phase_step;
+                if (sample_dt <= 0 || sample_dt > drift_gap_ns ||
+                    abs_phase_step > drift_jump_ns)
+                    reset_observer = true;
             }
 
-            int ret = AudioTrack_write(ao, bytes);
-            if (ret < 0 && bytes > 0) {
-                // Existing behavior retries an already-pending tail, but a
-                // write error on a freshly pulled block drops that local block.
-                // Record either case without changing it.
-                bool fci_retained = fci_pending_before > 0;
-                if (!fci_retained) {
-                    p->fci_pcm_error_drop_bytes += fci_outstanding_before;
-                    p->fci_pcm_block_offset = p->fci_pcm_block_bytes;
-                    p->fci_pcm_block_active = false;
-                }
-                MP_INFO(ao,
-                        "FCI_PCM_WRITE_ERROR epoch=%llu block=%llu ret=%d "
-                        "request_bytes=%d retained_for_retry=%d error_drop_bytes=%llu "
-                        "invariant_delta=%lld raw_ns=%lld\n",
-                        (unsigned long long)p->fci_pcm_epoch,
-                        (unsigned long long)p->fci_pcm_block_seq, ret, bytes,
-                        fci_retained,
-                        (unsigned long long)p->fci_pcm_error_drop_bytes,
-                        (long long)fci_pcm_invariant_delta(p),
-                        (long long)mp_raw_time_ns());
-            }'''
-    src = regex_in_function(
-        src,
-        "static MP_THREAD_VOID ao_thread(void *arg)",
-        r'(?m)^(?P<i>[ \t]*)int ret = AudioTrack_write\(ao, bytes\);[ \t]*$',
-        lambda m: m.group('i') + write_begin,
-        "PCM write begin/error accounting",
-    )
+            if (!p->contiguous_drift_tracking || reset_observer) {
+                reset_contiguous_clock_drift(p);
+                p->contiguous_drift_tracking = true;
+                p->contiguous_drift_anchor_now_ns = now;
+                p->contiguous_drift_anchor_phase_ns = phase_error;
+                p->contiguous_drift_prev_now_ns = now;
+                p->contiguous_drift_prev_phase_ns = phase_error;
+                drift_state = reset_observer ? "reset-discontinuity" : "warmup";
+            } else {
+                p->contiguous_drift_good_samples++;
+                int64_t window_ns = now - p->contiguous_drift_anchor_now_ns;
 
-    # Hash the exact prefix accepted by Android before the existing memmove
-    # changes p->chunk for a partial write.
-    src = regex_in_function(
-        src,
-        "static MP_THREAD_VOID ao_thread(void *arg)",
-        r'(?m)^(?P<i>[ \t]*)p->pending_bytes = bytes - ret;[ \t]*$',
-        lambda m: (m.group(0) + '\n' + m.group('i') +
-                   'if (ret > 0)\n' + m.group('i') +
-                   '    p->fci_pcm_write_hash = fci_pcm_hash_update(\n' + m.group('i') +
-                   '        p->fci_pcm_write_hash, p->chunk, ret);'),
-        "PCM accepted hash",
-    )
+                if (window_ns >= drift_window_ns &&
+                    p->contiguous_drift_good_samples >= 96)
+                {
+                    int64_t phase_delta =
+                        phase_error - p->contiguous_drift_anchor_phase_ns;
+                    int64_t abs_phase_delta = phase_delta < 0 ? -phase_delta : phase_delta;
+                    int64_t residual_ppb = phase_delta * 1000000000LL / window_ns;
+                    int64_t abs_residual_ppb = residual_ppb < 0 ? -residual_ppb : residual_ppb;
+                    int64_t old_rate_ppb = p->contiguous_drift_rate_ppb;
+                    const char *window_state = "hold-deadband";
 
-    write_end = r'''if (bytes > 0) {
-                    p->fci_pcm_accepted_bytes += ret;
-                    p->fci_pcm_block_offset += ret;
-                    int fci_outstanding_after = p->fci_pcm_block_bytes
-                                              - p->fci_pcm_block_offset;
-                    bool fci_block_done = fci_outstanding_after == 0;
-                    int fci_hash_match = -1;
-                    if (fci_block_done && p->fci_pcm_error_drop_bytes == 0)
-                        fci_hash_match = p->fci_pcm_pull_hash == p->fci_pcm_write_hash;
+                    if (abs_residual_ppb <= drift_max_observed_ppb) {
+                        // residual = hardware rate error - current applied rate.
+                        // Adding it back estimates the underlying hardware rate.
+                        int64_t estimated_rate_ppb = old_rate_ppb + residual_ppb;
+                        if (estimated_rate_ppb > drift_max_rate_ppb)
+                            estimated_rate_ppb = drift_max_rate_ppb;
+                        if (estimated_rate_ppb < -drift_max_rate_ppb)
+                            estimated_rate_ppb = -drift_max_rate_ppb;
+
+                        int64_t rate_step_ppb = estimated_rate_ppb - old_rate_ppb;
+                        if (abs_phase_delta < drift_min_delta_ns ||
+                            abs_residual_ppb < drift_deadband_ppb)
+                        {
+                            rate_step_ppb = 0;
+                        } else {
+                            // Quarter-step low-pass: convergence is deliberate,
+                            // never a one-window phase correction.
+                            rate_step_ppb /= 4;
+                            if (rate_step_ppb > drift_max_rate_step_ppb)
+                                rate_step_ppb = drift_max_rate_step_ppb;
+                            if (rate_step_ppb < -drift_max_rate_step_ppb)
+                                rate_step_ppb = -drift_max_rate_step_ppb;
+                            p->contiguous_drift_rate_ppb += rate_step_ppb;
+                            window_state = "rate-update";
+                        }
+                    } else {
+                        // A huge slope is treated as another clock/latency regime
+                        // change, never as something to chase gradually.
+                        p->contiguous_drift_rate_ppb = 0;
+                        window_state = "reject-slope";
+                    }
+
                     MP_INFO(ao,
-                            "FCI_PCM_WRITE_END epoch=%llu block=%llu offset_before=%d "
-                            "request_bytes=%d ret_bytes=%d offset_after=%d "
-                            "outstanding_bytes=%d pending_after=%d block_done=%d "
-                            "pulled_bytes=%llu accepted_bytes=%llu error_drop_bytes=%llu "
-                            "pull_hash=%016llx write_hash=%016llx stream_hash_match=%d "
-                            "invariant_delta=%lld raw_ns=%lld\n",
-                            (unsigned long long)p->fci_pcm_epoch,
-                            (unsigned long long)p->fci_pcm_block_seq,
-                            fci_offset_before, bytes, ret, p->fci_pcm_block_offset,
-                            fci_outstanding_after, p->pending_bytes, fci_block_done,
-                            (unsigned long long)p->fci_pcm_pulled_bytes,
-                            (unsigned long long)p->fci_pcm_accepted_bytes,
-                            (unsigned long long)p->fci_pcm_error_drop_bytes,
-                            (unsigned long long)p->fci_pcm_pull_hash,
-                            (unsigned long long)p->fci_pcm_write_hash,
-                            fci_hash_match, (long long)fci_pcm_invariant_delta(p),
-                            (long long)mp_raw_time_ns());
-                    if (fci_block_done)
-                        p->fci_pcm_block_active = false;
-                }'''
-    src = regex_in_function(
-        src,
-        "static MP_THREAD_VOID ao_thread(void *arg)",
-        r'(?m)^(?P<i>[ \t]*)if \(ret > 0 && p->pending_bytes > 0\)\n(?P=i)    memmove\(p->chunk, \(char \*\)p->chunk \+ ret, p->pending_bytes\);[ \t]*$',
-        lambda m: m.group(0) + '\n' + m.group('i') + write_end,
-        "PCM write completion accounting",
-    )
+                            "FCI_AO_DRIFT_SERVO state=%s window_ms=%.3f "
+                            "phase_delta_ns=%lld residual_ppb=%lld "
+                            "old_rate_ppb=%lld new_rate_ppb=%lld good_samples=%d\n",
+                            window_state, window_ns / 1e6,
+                            (long long)phase_delta, (long long)residual_ppb,
+                            (long long)old_rate_ppb,
+                            (long long)p->contiguous_drift_rate_ppb,
+                            p->contiguous_drift_good_samples);
 
-    reset_before = r'''int fci_outstanding = p->fci_pcm_block_active
-        ? p->fci_pcm_block_bytes - p->fci_pcm_block_offset : 0;
-    int64_t fci_delta = fci_pcm_invariant_delta(p);
-    int fci_hash_match = -1;
-    if (fci_outstanding == 0 && p->fci_pcm_error_drop_bytes == 0 &&
-        p->fci_pcm_epoch != 0)
-        fci_hash_match = p->fci_pcm_pull_hash == p->fci_pcm_write_hash;
-    MP_INFO(ao,
-            "FCI_PCM_RESET_AUDIT phase=before epoch=%llu block=%llu "
-            "block_active=%d block_offset=%d block_bytes=%d "
-            "pulled_bytes=%llu accepted_bytes=%llu outstanding_bytes=%d "
-            "pending_bytes=%d error_drop_bytes=%llu pull_hash=%016llx "
-            "write_hash=%016llx stream_hash_match=%d invariant_delta=%lld raw_ns=%lld\n",
-            (unsigned long long)p->fci_pcm_epoch,
-            (unsigned long long)p->fci_pcm_block_seq,
-            p->fci_pcm_block_active, p->fci_pcm_block_offset,
-            p->fci_pcm_block_bytes,
-            (unsigned long long)p->fci_pcm_pulled_bytes,
-            (unsigned long long)p->fci_pcm_accepted_bytes,
-            fci_outstanding, p->pending_bytes,
-            (unsigned long long)p->fci_pcm_error_drop_bytes,
-            (unsigned long long)p->fci_pcm_pull_hash,
-            (unsigned long long)p->fci_pcm_write_hash,
-            fci_hash_match, (long long)fci_delta,
-            (long long)mp_raw_time_ns());
-    if (fci_outstanding != p->pending_bytes) {
-        MP_ERR(ao,
-               "FCI_PCM_INVARIANT status=BAD reason=reset_pending_mismatch "
-               "epoch=%llu outstanding=%d pending_bytes=%d raw_ns=%lld\n",
-               (unsigned long long)p->fci_pcm_epoch, fci_outstanding,
-               p->pending_bytes, (long long)mp_raw_time_ns());
+                    p->contiguous_drift_anchor_now_ns = now;
+                    p->contiguous_drift_anchor_phase_ns = phase_error;
+                    p->contiguous_drift_good_samples = 0;
+                }
+
+                p->contiguous_drift_prev_now_ns = now;
+                p->contiguous_drift_prev_phase_ns = phase_error;
+                drift_state = "tracking";
+            }
+
+            // Rate-only slew. At 500 ppm a normal 150 ms chunk changes by
+            // just 75 us. A hard 100 us per-pull cap is an additional guard.
+            slew_ns = duration_ns * p->contiguous_drift_rate_ppb / 1000000000LL;
+            int64_t max_slew_ns = 100 * 1000LL;
+            if (slew_ns > max_slew_ns)
+                slew_ns = max_slew_ns;
+            if (slew_ns < -max_slew_ns)
+                slew_ns = -max_slew_ns;
+
+            // Never manufacture an underrun merely to correct clock rate.
+            if (slew_ns < 0 && predicted_end + slew_ns < now + 1000 * 1000LL) {
+                slew_ns = 0;
+                drift_state = "hold-low-buffer";
+            }
+
+            new_end = predicted_end + slew_ns;
+        } else if (keep_contiguous && old_end > 0) {
+            mode = "reanchor-expired";
+            reset_contiguous_clock_drift(p);
+            drift_state = "reset-expired";
+        } else if (keep_contiguous) {
+            reset_contiguous_clock_drift(p);
+            drift_state = "seed";
+        }
+
+        p->end_time_ns = new_end;
+        MP_INFO(ao,
+                "FCI_AO_ENDTIME_UPDATE samples=%d mode=%s old_end_ns=%lld "
+                "measured_end_ns=%lld predicted_end_ns=%lld new_end_ns=%lld "
+                "end_step_ns=%lld duration_ns=%lld phase_error_ns=%lld "
+                "slew_ns=%lld drift_rate_ppb=%lld drift_state=%s "
+                "drift_good_samples=%d now_ns=%lld remaining_ms=%.3f\n",
+                pos, mode, (long long)old_end, (long long)measured_end,
+                (long long)predicted_end, (long long)new_end,
+                (long long)(new_end - old_end), (long long)duration_ns,
+                (long long)phase_error, (long long)slew_ns,
+                (long long)p->contiguous_drift_rate_ppb, drift_state,
+                p->contiguous_drift_good_samples, (long long)now,
+                (new_end - now) / 1e6);
     }'''
-    src = regex_in_function(
-        src,
-        "static void stop(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)p->pending_bytes = 0;[ \t]*$',
-        lambda m: m.group('i') + reset_before + '\n' + m.group(0),
-        "PCM reset audit before discard",
-    )
 
-    reset_after = r'''p->fci_pcm_epoch = p->fci_pcm_epoch ? p->fci_pcm_epoch + 1 : 1;
-    p->fci_pcm_block_seq = 0;
-    p->fci_pcm_pulled_bytes = 0;
-    p->fci_pcm_accepted_bytes = 0;
-    p->fci_pcm_error_drop_bytes = 0;
-    p->fci_pcm_pull_hash = FCI_PCM_FNV_OFFSET;
-    p->fci_pcm_write_hash = FCI_PCM_FNV_OFFSET;
-    p->fci_pcm_block_hash = 0;
-    p->fci_pcm_block_bytes = 0;
-    p->fci_pcm_block_offset = 0;
-    p->fci_pcm_block_active = false;
-    p->fci_pcm_last_state = 0;
-    MP_INFO(ao,
-            "FCI_PCM_RESET_AUDIT phase=after new_epoch=%llu pulled_bytes=0 "
-            "accepted_bytes=0 outstanding_bytes=0 pending_bytes=%d "
-            "pull_hash=%016llx write_hash=%016llx invariant_delta=%lld raw_ns=%lld\n",
-            (unsigned long long)p->fci_pcm_epoch, p->pending_bytes,
-            (unsigned long long)p->fci_pcm_pull_hash,
-            (unsigned long long)p->fci_pcm_write_hash,
-            (long long)fci_pcm_invariant_delta(p),
-            (long long)mp_raw_time_ns());'''
-    src = regex_in_function(
-        src,
-        "static void stop(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)p->timestamp_set = false;[ \t]*$',
-        lambda m: m.group(0) + '\n' + m.group('i') + reset_after,
-        "PCM reset audit new epoch",
-    )
-
+    fn = fn[:old_start] + endtime_block + fn[old_end:]
+    src = src[:fn_start] + fn + src[fn_end:]
     p.write_text(src)
-PY_FCI_PCM_AUDIT
+PY_AUDIO_LONG_TERM_DRIFT
 
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
