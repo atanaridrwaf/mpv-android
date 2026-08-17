@@ -6,28 +6,6 @@ import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
 import android.view.TextureView
-import java.util.concurrent.atomic.AtomicLong
-
-internal object FrameContinuityTrace {
-    private val commandSequence = AtomicLong(0)
-    private val surfaceSequence = AtomicLong(0)
-
-    @Volatile
-    var commandGeneration: Long = 0
-        private set
-
-    fun pauseCommand(operation: String, requestedState: String) {
-        val generation = commandSequence.incrementAndGet()
-        commandGeneration = generation
-        Log.i(
-            "mpv",
-            "FCI_UI_PAUSE_REQUEST ui_gen=$generation op=$operation " +
-                "requested=$requestedState mono_ns=${System.nanoTime()}",
-        )
-    }
-
-    fun nextSurfaceSequence(): Long = surfaceSequence.incrementAndGet()
-}
 
 // Contains only the essential code needed to get a picture on the screen
 
@@ -249,13 +227,6 @@ abstract class BaseMPVView(context: Context, attrs: AttributeSet) : TextureView(
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        val sequence = FrameContinuityTrace.nextSurfaceSequence()
-        Log.i(
-            TAG,
-            "FCI_SURFACE_UPDATE surface_seq=$sequence " +
-                "ui_gen=${FrameContinuityTrace.commandGeneration} " +
-                "surface_ts_ns=${surface.timestamp} mono_ns=${System.nanoTime()}",
-        )
         onSurfaceTextureFrameAvailable?.invoke()
     }
 
