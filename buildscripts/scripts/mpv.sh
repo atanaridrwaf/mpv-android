@@ -327,13 +327,110 @@ if "ao_read_data_with_start_time" not in src:
     p.write_text(src)
 PY_AUDIO_CLOCK_CONTINUITY
 
+# A freshly reset AudioTrack epoch has no queued frames yet. On some Android
+# devices getTimestamp() is not available on the very first pull, while the
+# hidden Java getLatency() fallback reports a large fixed pipeline value. Using
+# that fallback as the absolute seed permanently bakes the transient into v2's
+# otherwise-correct contiguous timeline. Probe the normal clock exactly as
+# before, but if this is the first PCM pull (written_frames == 0) and the probe
+# still did not obtain an AudioTimestamp, seed from "now" instead. The actual
+# sample duration is added by ao_read_data_with_start_time(), so short reads stay
+# exact. Once any frames have been accepted, or a timestamp exists, this helper
+# has the same timing semantics as AudioTrack_getLatency().
+python3 - <<'PY_AUDIO_EPOCH_SEED_GUARD'
+from pathlib import Path
+import re
+
+
+def function_span(text, signature, label):
+    starts = [m.start() for m in re.finditer(re.escape(signature), text)]
+    if len(starts) != 1:
+        raise SystemExit(f"AudioTrack epoch seed guard failed at {label}: "
+                         f"expected one function signature, found {len(starts)}")
+    start = starts[0]
+    brace = text.find("{", start + len(signature))
+    if brace < 0:
+        raise SystemExit(f"AudioTrack epoch seed guard failed at {label}: opening brace not found")
+    depth = 0
+    for i in range(brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    raise SystemExit(f"AudioTrack epoch seed guard failed at {label}: closing brace not found")
+
+
+def regex_once(text, pattern, repl, label, flags=0):
+    rx = re.compile(pattern, flags)
+    matches = list(rx.finditer(text))
+    if len(matches) != 1:
+        raise SystemExit(f"AudioTrack epoch seed guard failed at {label}: "
+                         f"expected one anchor, found {len(matches)}")
+    return rx.sub(repl, text, count=1)
+
+
+p = Path("audio/out/ao_audiotrack.c")
+src = p.read_text()
+if "AudioTrack_getTimelineLatency" not in src:
+    if "ao_read_data_with_start_time" not in src:
+        raise SystemExit("AudioTrack epoch seed guard requires the v2 contiguous timeline patch")
+
+    helper = r'''
+
+static double AudioTrack_getTimelineLatency(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    double measured = AudioTrack_getLatency(ao);
+
+    // Before the first write of a new PCM epoch there cannot be queued frames
+    // from that epoch yet. If getTimestamp() is still unavailable, the hidden
+    // Java latency is an unqualified pipeline estimate, not a safe absolute
+    // timeline anchor. Keep the timestamp probe side effect, but do not seed
+    // the epoch from that fallback.
+    if (p->written_frames == 0 && !p->timestamp_set &&
+        p->format != AudioFormat.ENCODING_IEC61937)
+    {
+        MP_INFO(ao,
+                "FCI_AT_EPOCH_SEED_GUARD action=zero_untrusted_fallback "
+                "raw_latency=%.9f guarded_latency=0.000000000 written=%u "
+                "timestamp_set=%d reset_pending=%d pending_bytes=%d raw_ns=%lld\n",
+                measured, p->written_frames, p->timestamp_set,
+                p->reset_pending, p->pending_bytes, (long long)mp_raw_time_ns());
+        return 0;
+    }
+
+    return measured;
+}
+'''
+    src = regex_once(
+        src,
+        r'(?m)^static MP_THREAD_VOID ao_thread\(void \*arg\)\n\{$',
+        lambda m: helper + '\n' + m.group(0),
+        "seed helper insertion",
+    )
+
+    start, end = function_span(src, "static MP_THREAD_VOID ao_thread(void *arg)", "ao thread")
+    fn = src[start:end]
+    fn = regex_once(
+        fn,
+        r'MP_TIME_S_TO_NS\(AudioTrack_getLatency\(ao\)\)',
+        'MP_TIME_S_TO_NS(AudioTrack_getTimelineLatency(ao))',
+        "ao thread latency call",
+    )
+    src = src[:start] + fn + src[end:]
+    p.write_text(src)
+PY_AUDIO_EPOCH_SEED_GUARD
+
 # Preserve v2's hard PCM-clock continuity, then add a deliberately conservative
 # long-term rate servo. This is rate-only: fixed AudioTrack phase offsets are
-# never corrected, and a live timeline is never hard-reanchored. The observer
-# must see a smooth trend for 30 seconds before it can change the rate; every
-# pause/resume/reset or timestamp/latency discontinuity discards its training.
-# Even after qualification, correction is capped at 500 ppm and 100 us per
-# audio pull, so it cannot create the multi-frame deadline jumps fixed by v2.
+# never corrected, and a live timeline is never hard-reanchored. A single
+# 30-second slope is only an observation, not authority: three consecutive
+# qualifying windows (about 90 seconds) must agree on direction before the rate
+# can change. Sign-flipping phase jitter therefore resets qualification instead
+# of moving the timeline. Pause/resume/reset and clock discontinuities discard
+# all training. Correction remains capped at 500 ppm and 100 us per audio pull.
 python3 - <<'PY_AUDIO_LONG_TERM_DRIFT'
 from pathlib import Path
 import re
@@ -406,7 +503,10 @@ if "contiguous_drift_rate_ppb" not in src:
             m.group('i') + 'int64_t contiguous_drift_anchor_phase_ns;\n' +
             m.group('i') + 'int64_t contiguous_drift_prev_now_ns;\n' +
             m.group('i') + 'int64_t contiguous_drift_prev_phase_ns;\n' +
-            m.group('i') + 'int64_t contiguous_drift_rate_ppb;',
+            m.group('i') + 'int64_t contiguous_drift_rate_ppb;\n' +
+            m.group('i') + 'int contiguous_drift_confirm_sign;\n' +
+            m.group('i') + 'int contiguous_drift_confirm_windows;\n' +
+            m.group('i') + 'int64_t contiguous_drift_confirm_sum_ppb;',
         "buffer drift state",
     )
 
@@ -421,6 +521,9 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
     p->contiguous_drift_prev_now_ns = 0;
     p->contiguous_drift_prev_phase_ns = 0;
     p->contiguous_drift_rate_ppb = 0;
+    p->contiguous_drift_confirm_sign = 0;
+    p->contiguous_drift_confirm_windows = 0;
+    p->contiguous_drift_confirm_sum_ppb = 0;
 }
 '''
     src = regex_once(
@@ -477,8 +580,8 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
         if (keep_contiguous && old_end > 0 && predicted_end >= now) {
             mode = "contiguous";
 
-            // The measured phase itself is not trusted as an absolute target.
-            // Only its slow slope can train the servo.
+            // Absolute measured phase is never a correction target. Only a
+            // persistent slope can qualify as a rate error.
             const int64_t drift_jump_ns = 20 * 1000 * 1000LL;
             const int64_t drift_gap_ns = 1000 * 1000 * 1000LL;
             const int64_t drift_window_ns = 30LL * 1000 * 1000 * 1000;
@@ -487,6 +590,7 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
             const int64_t drift_max_rate_ppb = 500 * 1000LL;
             const int64_t drift_max_rate_step_ppb = 125 * 1000LL;
             const int64_t drift_deadband_ppb = 5 * 1000LL;
+            const int drift_confirm_required = 3;
 
             bool reset_observer = false;
             if (p->contiguous_drift_tracking) {
@@ -519,48 +623,92 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
                     int64_t residual_ppb = phase_delta * 1000000000LL / window_ns;
                     int64_t abs_residual_ppb = residual_ppb < 0 ? -residual_ppb : residual_ppb;
                     int64_t old_rate_ppb = p->contiguous_drift_rate_ppb;
+                    int confirm_sign_log = p->contiguous_drift_confirm_sign;
+                    int confirm_windows_log = p->contiguous_drift_confirm_windows;
+                    int64_t qualified_ppb = 0;
                     const char *window_state = "hold-deadband";
 
-                    if (abs_residual_ppb <= drift_max_observed_ppb) {
-                        // residual = hardware rate error - current applied rate.
-                        // Adding it back estimates the underlying hardware rate.
-                        int64_t estimated_rate_ppb = old_rate_ppb + residual_ppb;
-                        if (estimated_rate_ppb > drift_max_rate_ppb)
-                            estimated_rate_ppb = drift_max_rate_ppb;
-                        if (estimated_rate_ppb < -drift_max_rate_ppb)
-                            estimated_rate_ppb = -drift_max_rate_ppb;
-
-                        int64_t rate_step_ppb = estimated_rate_ppb - old_rate_ppb;
-                        if (abs_phase_delta < drift_min_delta_ns ||
-                            abs_residual_ppb < drift_deadband_ppb)
-                        {
-                            rate_step_ppb = 0;
+                    if (abs_residual_ppb > drift_max_observed_ppb) {
+                        // A huge slope is a timestamp/latency regime change, not
+                        // a frequency error. Drop both the learned rate and all
+                        // pending qualification rather than chasing it.
+                        p->contiguous_drift_rate_ppb = 0;
+                        p->contiguous_drift_confirm_sign = 0;
+                        p->contiguous_drift_confirm_windows = 0;
+                        p->contiguous_drift_confirm_sum_ppb = 0;
+                        confirm_sign_log = 0;
+                        confirm_windows_log = 0;
+                        window_state = "reject-slope";
+                    } else if (abs_phase_delta < drift_min_delta_ns ||
+                               abs_residual_ppb < drift_deadband_ppb)
+                    {
+                        // A flat/noisy window breaks the evidence chain. Do not
+                        // let separated same-sign excursions accumulate.
+                        p->contiguous_drift_confirm_sign = 0;
+                        p->contiguous_drift_confirm_windows = 0;
+                        p->contiguous_drift_confirm_sum_ppb = 0;
+                        confirm_sign_log = 0;
+                        confirm_windows_log = 0;
+                    } else {
+                        int sign = residual_ppb > 0 ? 1 : -1;
+                        if (p->contiguous_drift_confirm_sign != sign) {
+                            p->contiguous_drift_confirm_sign = sign;
+                            p->contiguous_drift_confirm_windows = 1;
+                            p->contiguous_drift_confirm_sum_ppb = residual_ppb;
+                            window_state = "qualify-new";
                         } else {
-                            // Quarter-step low-pass: convergence is deliberate,
-                            // never a one-window phase correction.
-                            rate_step_ppb /= 4;
+                            p->contiguous_drift_confirm_windows++;
+                            p->contiguous_drift_confirm_sum_ppb += residual_ppb;
+                            window_state = "qualify";
+                        }
+
+                        confirm_sign_log = p->contiguous_drift_confirm_sign;
+                        confirm_windows_log = p->contiguous_drift_confirm_windows;
+
+                        if (p->contiguous_drift_confirm_windows >=
+                            drift_confirm_required)
+                        {
+                            // Use the mean only after three consecutive windows
+                            // agree on direction. The quarter-step remains a
+                            // low-pass rate correction, never a phase correction.
+                            qualified_ppb = p->contiguous_drift_confirm_sum_ppb /
+                                            p->contiguous_drift_confirm_windows;
+                            int64_t estimated_rate_ppb = old_rate_ppb + qualified_ppb;
+                            if (estimated_rate_ppb > drift_max_rate_ppb)
+                                estimated_rate_ppb = drift_max_rate_ppb;
+                            if (estimated_rate_ppb < -drift_max_rate_ppb)
+                                estimated_rate_ppb = -drift_max_rate_ppb;
+
+                            int64_t rate_step_ppb =
+                                (estimated_rate_ppb - old_rate_ppb) / 4;
                             if (rate_step_ppb > drift_max_rate_step_ppb)
                                 rate_step_ppb = drift_max_rate_step_ppb;
                             if (rate_step_ppb < -drift_max_rate_step_ppb)
                                 rate_step_ppb = -drift_max_rate_step_ppb;
-                            p->contiguous_drift_rate_ppb += rate_step_ppb;
-                            window_state = "rate-update";
+
+                            if (rate_step_ppb != 0) {
+                                p->contiguous_drift_rate_ppb += rate_step_ppb;
+                                window_state = "rate-update-confirmed";
+                            } else {
+                                window_state = "hold-quantized";
+                            }
+
+                            p->contiguous_drift_confirm_sign = 0;
+                            p->contiguous_drift_confirm_windows = 0;
+                            p->contiguous_drift_confirm_sum_ppb = 0;
                         }
-                    } else {
-                        // A huge slope is treated as another clock/latency regime
-                        // change, never as something to chase gradually.
-                        p->contiguous_drift_rate_ppb = 0;
-                        window_state = "reject-slope";
                     }
 
                     MP_INFO(ao,
                             "FCI_AO_DRIFT_SERVO state=%s window_ms=%.3f "
-                            "phase_delta_ns=%lld residual_ppb=%lld "
-                            "old_rate_ppb=%lld new_rate_ppb=%lld good_samples=%d\n",
+                            "phase_delta_ns=%lld residual_ppb=%lld qualified_ppb=%lld "
+                            "old_rate_ppb=%lld new_rate_ppb=%lld "
+                            "confirm_sign=%d confirm_windows=%d good_samples=%d\n",
                             window_state, window_ns / 1e6,
                             (long long)phase_delta, (long long)residual_ppb,
-                            (long long)old_rate_ppb,
+                            (long long)qualified_ppb, (long long)old_rate_ppb,
                             (long long)p->contiguous_drift_rate_ppb,
+                            confirm_sign_log, confirm_windows_log,
                             p->contiguous_drift_good_samples);
 
                     p->contiguous_drift_anchor_now_ns = now;
@@ -604,13 +752,16 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
                 "measured_end_ns=%lld predicted_end_ns=%lld new_end_ns=%lld "
                 "end_step_ns=%lld duration_ns=%lld phase_error_ns=%lld "
                 "slew_ns=%lld drift_rate_ppb=%lld drift_state=%s "
-                "drift_good_samples=%d now_ns=%lld remaining_ms=%.3f\n",
+                "drift_good_samples=%d drift_confirm_sign=%d "
+                "drift_confirm_windows=%d now_ns=%lld remaining_ms=%.3f\n",
                 pos, mode, (long long)old_end, (long long)measured_end,
                 (long long)predicted_end, (long long)new_end,
                 (long long)(new_end - old_end), (long long)duration_ns,
                 (long long)phase_error, (long long)slew_ns,
                 (long long)p->contiguous_drift_rate_ppb, drift_state,
-                p->contiguous_drift_good_samples, (long long)now,
+                p->contiguous_drift_good_samples,
+                p->contiguous_drift_confirm_sign,
+                p->contiguous_drift_confirm_windows, (long long)now,
                 (new_end - now) / 1e6);
     }'''
 
@@ -618,7 +769,6 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
     src = src[:fn_start] + fn + src[fn_end:]
     p.write_text(src)
 PY_AUDIO_LONG_TERM_DRIFT
-
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
 # their target and performs one seek to the closest result in the requested
