@@ -398,7 +398,7 @@ if "contiguous_drift_rate_ppb" not in src:
 
     src = regex_once(
         src,
-        r'(?m)^(?P<i>[ \t]*)int64_t end_time_ns; // absolute output time of last played sample[ \t]*$',
+        r'(?m)^(?P<i>[ \t]*)int64_t[ \t]+end_time_ns;[ \t]*//[ \t]*absolute output time of last played sample[ \t]*$',
         lambda m: m.group(0) + '\n' +
             m.group('i') + 'bool contiguous_drift_tracking;\n' +
             m.group('i') + 'int contiguous_drift_good_samples;\n' +
