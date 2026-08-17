@@ -147,24 +147,9 @@ PATCH
 fi
 
 # Keep AudioTrack's pull-AO presentation timeline continuous across normal
-# pause/resume and within a post-reset stream epoch.
-#
-# Two experimentally proven issues are handled here:
-#   1. ao_thread used the requested chunk duration before ao_read_data() returned
-#      the actual sample count. A short read therefore overstated end_time.
-#   2. AudioTrack's instantaneous latency/playhead estimate can change phase
-#      after pause/resume and while a new post-seek clock settles. Replacing
-#      p->end_time_ns with that new absolute estimate makes the video clock jump.
-#
-# For contiguous PCM, the presentation time of the new last sample is defined
-# by the previous last sample plus the duration of the samples actually read.
-# Therefore the measured AudioTrack time is used to seed a new epoch only. Once
-# an epoch has a live end_time, subsequent contiguous reads extend it by the
-# actual returned sample duration. If that predicted end is already in the past,
-# the stream really lost continuity and the measured clock is allowed to re-anchor.
-#
-# This leaves AudioTrack timestamp selection itself unchanged and keeps real
-# AudioTrack.pause()/play() with no normal-pause flush/reset.
+# pause/resume and within each post-reset stream epoch. For contiguous PCM,
+# advance the previous end time by the duration of the samples actually read;
+# use the measured AudioTrack clock only to seed a new/expired epoch.
 python3 - <<'PY_AUDIO_CLOCK_CONTINUITY'
 from pathlib import Path
 import re
@@ -181,10 +166,9 @@ def function_span(text, signature, label):
         raise SystemExit(f"AudioTrack continuity fix failed at {label}: opening brace not found")
     depth = 0
     for i in range(brace, len(text)):
-        c = text[i]
-        if c == "{":
+        if text[i] == "{":
             depth += 1
-        elif c == "}":
+        elif text[i] == "}":
             depth -= 1
             if depth == 0:
                 return start, i + 1
@@ -240,27 +224,11 @@ if "ao_read_data_with_start_time" not in src:
         int64_t duration_ns = MP_TIME_S_TO_NS(pos / (double)ao->samplerate);
         int64_t measured_end = out_time_ns + (out_time_is_start ? duration_ns : 0);
         int64_t predicted_end = old_end > 0 ? old_end + duration_ns : measured_end;
-        int64_t new_end = measured_end;
-        const char *mode = "measured";
 
-        if (keep_contiguous && old_end > 0 && predicted_end >= now) {
-            new_end = predicted_end;
-            mode = "contiguous";
-        } else if (keep_contiguous && old_end > 0) {
-            mode = "reanchor-expired";
-        }
-
-        p->end_time_ns = new_end;
-        MP_INFO(ao,
-                "FCI_AO_ENDTIME_UPDATE samples=%d mode=%s old_end_ns=%lld "
-                "measured_end_ns=%lld predicted_end_ns=%lld new_end_ns=%lld "
-                "end_step_ns=%lld duration_ns=%lld phase_error_ns=%lld "
-                "now_ns=%lld remaining_ms=%.3f\\n",
-                pos, mode, (long long)old_end, (long long)measured_end,
-                (long long)predicted_end, (long long)new_end,
-                (long long)(new_end - old_end), (long long)duration_ns,
-                (long long)(measured_end - predicted_end), (long long)now,
-                (new_end - now) / 1e6);
+        if (keep_contiguous && old_end > 0 && predicted_end >= now)
+            p->end_time_ns = predicted_end;
+        else
+            p->end_time_ns = measured_end;
     }'''
     src = regex_in_function(
         src,
@@ -278,9 +246,16 @@ if "ao_read_data_with_start_time" not in src:
         "existing ao_read_data call",
     )
 
-    start, end = function_span(src, "int ao_read_data(struct ao *ao, void **data, int samples,", "ao_read_data function")
+    start, end = function_span(
+        src,
+        "int ao_read_data(struct ao *ao, void **data, int samples,",
+        "ao_read_data function",
+    )
     helper = r'''
 
+// Same locking/underrun semantics as ao_read_data(), but out_start_time_ns is
+// the expected output time of the first returned sample. The common buffer then
+// derives the last-sample time from the number of samples actually returned.
 int ao_read_data_with_start_time(struct ao *ao, void **data, int samples,
                                  int64_t out_start_time_ns, bool *eof,
                                  bool pad_silence, bool blocking)
@@ -309,7 +284,7 @@ int ao_read_data_with_start_time(struct ao *ao, void **data, int samples,
 
 p = Path("audio/out/ao_audiotrack.c")
 src = p.read_text()
-if "ao_read_data_with_start_time" not in src:
+if "ao_read_data_with_start_time(ao, &p->chunk" not in src:
     src = regex_in_function(
         src,
         "static MP_THREAD_VOID ao_thread(void *arg)",
@@ -322,21 +297,14 @@ if "ao_read_data_with_start_time" not in src:
         "static MP_THREAD_VOID ao_thread(void *arg)",
         r'ao_read_data\(ao, &p->chunk, read_samples, ts,',
         'ao_read_data_with_start_time(ao, &p->chunk, read_samples, ts,',
-        "AudioTrack contiguous timed read",
+        "AudioTrack actual-sample timed read",
     )
     p.write_text(src)
 PY_AUDIO_CLOCK_CONTINUITY
 
-# A freshly reset AudioTrack epoch has no queued frames yet. On some Android
-# devices getTimestamp() is not available on the very first pull, while the
-# hidden Java getLatency() fallback reports a large fixed pipeline value. Using
-# that fallback as the absolute seed permanently bakes the transient into v2's
-# otherwise-correct contiguous timeline. Probe the normal clock exactly as
-# before, but if this is the first PCM pull (written_frames == 0) and the probe
-# still did not obtain an AudioTimestamp, seed from "now" instead. The actual
-# sample duration is added by ao_read_data_with_start_time(), so short reads stay
-# exact. Once any frames have been accepted, or a timestamp exists, this helper
-# has the same timing semantics as AudioTrack_getLatency().
+# The first pull after reset/seek may occur before AudioTimestamp is available.
+# In that one state, do not seed the new epoch from Android's Java getLatency()
+# fallback; it is a pipeline estimate rather than a reliable absolute anchor.
 python3 - <<'PY_AUDIO_EPOCH_SEED_GUARD'
 from pathlib import Path
 import re
@@ -375,7 +343,7 @@ p = Path("audio/out/ao_audiotrack.c")
 src = p.read_text()
 if "AudioTrack_getTimelineLatency" not in src:
     if "ao_read_data_with_start_time" not in src:
-        raise SystemExit("AudioTrack epoch seed guard requires the v2 contiguous timeline patch")
+        raise SystemExit("AudioTrack epoch seed guard requires the contiguous timeline patch")
 
     helper = r'''
 
@@ -384,22 +352,9 @@ static double AudioTrack_getTimelineLatency(struct ao *ao)
     struct priv *p = ao->priv;
     double measured = AudioTrack_getLatency(ao);
 
-    // Before the first write of a new PCM epoch there cannot be queued frames
-    // from that epoch yet. If getTimestamp() is still unavailable, the hidden
-    // Java latency is an unqualified pipeline estimate, not a safe absolute
-    // timeline anchor. Keep the timestamp probe side effect, but do not seed
-    // the epoch from that fallback.
     if (p->written_frames == 0 && !p->timestamp_set &&
         p->format != AudioFormat.ENCODING_IEC61937)
-    {
-        MP_INFO(ao,
-                "FCI_AT_EPOCH_SEED_GUARD action=zero_untrusted_fallback "
-                "raw_latency=%.9f guarded_latency=0.000000000 written=%u "
-                "timestamp_set=%d reset_pending=%d pending_bytes=%d raw_ns=%lld\n",
-                measured, p->written_frames, p->timestamp_set,
-                p->reset_pending, p->pending_bytes, (long long)mp_raw_time_ns());
         return 0;
-    }
 
     return measured;
 }
@@ -423,14 +378,10 @@ static double AudioTrack_getTimelineLatency(struct ao *ao)
     p.write_text(src)
 PY_AUDIO_EPOCH_SEED_GUARD
 
-# Preserve v2's hard PCM-clock continuity, then add a deliberately conservative
-# long-term rate servo. This is rate-only: fixed AudioTrack phase offsets are
-# never corrected, and a live timeline is never hard-reanchored. A single
-# 30-second slope is only an observation, not authority: three consecutive
-# qualifying windows (about 90 seconds) must agree on direction before the rate
-# can change. Sign-flipping phase jitter therefore resets qualification instead
-# of moving the timeline. Pause/resume/reset and clock discontinuities discard
-# all training. Correction remains capped at 500 ppm and 100 us per audio pull.
+# Track only persistent long-term clock-rate drift. Fixed phase offsets are not
+# correction targets, and a live contiguous timeline is never hard-reanchored.
+# Three consecutive 30-second windows must agree on drift direction before a
+# bounded rate-only correction is allowed.
 python3 - <<'PY_AUDIO_LONG_TERM_DRIFT'
 from pathlib import Path
 import re
@@ -490,8 +441,8 @@ def regex_in_function(text, signature, pattern, repl, label, flags=0):
 p = Path("audio/out/buffer.c")
 src = p.read_text()
 if "contiguous_drift_rate_ppb" not in src:
-    if "ao_read_data_with_start_time" not in src or "FCI_AO_ENDTIME_UPDATE" not in src:
-        raise SystemExit("AudioTrack drift servo requires the v2 contiguous timeline patch")
+    if "ao_read_data_with_start_time" not in src:
+        raise SystemExit("AudioTrack drift servo requires the contiguous timeline patch")
 
     src = regex_once(
         src,
@@ -558,12 +509,12 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
         "contiguous end-time function",
     )
     fn = src[fn_start:fn_end]
-    if "bool keep_contiguous" not in fn or "FCI_AO_ENDTIME_UPDATE" not in fn:
-        raise SystemExit("AudioTrack drift servo: v2 end-time function shape not found")
+    if "bool keep_contiguous" not in fn:
+        raise SystemExit("AudioTrack drift servo: contiguous end-time function shape not found")
     if_start = fn.find("if (pos > 0) {")
     if if_start < 0:
         raise SystemExit("AudioTrack drift servo: pos>0 block not found")
-    old_start, old_end = block_span(fn, if_start, "v2 end-time block")
+    old_start, old_end = block_span(fn, if_start, "contiguous end-time block")
 
     endtime_block = r'''if (pos > 0) {
         int64_t old_end = p->end_time_ns;
@@ -574,14 +525,8 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
         int64_t new_end = measured_end;
         int64_t phase_error = measured_end - predicted_end;
         int64_t slew_ns = 0;
-        const char *mode = "measured";
-        const char *drift_state = "off";
 
         if (keep_contiguous && old_end > 0 && predicted_end >= now) {
-            mode = "contiguous";
-
-            // Absolute measured phase is never a correction target. Only a
-            // persistent slope can qualify as a rate error.
             const int64_t drift_jump_ns = 20 * 1000 * 1000LL;
             const int64_t drift_gap_ns = 1000 * 1000 * 1000LL;
             const int64_t drift_window_ns = 30LL * 1000 * 1000 * 1000;
@@ -609,7 +554,6 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
                 p->contiguous_drift_anchor_phase_ns = phase_error;
                 p->contiguous_drift_prev_now_ns = now;
                 p->contiguous_drift_prev_phase_ns = phase_error;
-                drift_state = reset_observer ? "reset-discontinuity" : "warmup";
             } else {
                 p->contiguous_drift_good_samples++;
                 int64_t window_ns = now - p->contiguous_drift_anchor_now_ns;
@@ -623,56 +567,35 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
                     int64_t residual_ppb = phase_delta * 1000000000LL / window_ns;
                     int64_t abs_residual_ppb = residual_ppb < 0 ? -residual_ppb : residual_ppb;
                     int64_t old_rate_ppb = p->contiguous_drift_rate_ppb;
-                    int confirm_sign_log = p->contiguous_drift_confirm_sign;
-                    int confirm_windows_log = p->contiguous_drift_confirm_windows;
-                    int64_t qualified_ppb = 0;
-                    const char *window_state = "hold-deadband";
 
                     if (abs_residual_ppb > drift_max_observed_ppb) {
-                        // A huge slope is a timestamp/latency regime change, not
-                        // a frequency error. Drop both the learned rate and all
-                        // pending qualification rather than chasing it.
                         p->contiguous_drift_rate_ppb = 0;
                         p->contiguous_drift_confirm_sign = 0;
                         p->contiguous_drift_confirm_windows = 0;
                         p->contiguous_drift_confirm_sum_ppb = 0;
-                        confirm_sign_log = 0;
-                        confirm_windows_log = 0;
-                        window_state = "reject-slope";
                     } else if (abs_phase_delta < drift_min_delta_ns ||
                                abs_residual_ppb < drift_deadband_ppb)
                     {
-                        // A flat/noisy window breaks the evidence chain. Do not
-                        // let separated same-sign excursions accumulate.
                         p->contiguous_drift_confirm_sign = 0;
                         p->contiguous_drift_confirm_windows = 0;
                         p->contiguous_drift_confirm_sum_ppb = 0;
-                        confirm_sign_log = 0;
-                        confirm_windows_log = 0;
                     } else {
                         int sign = residual_ppb > 0 ? 1 : -1;
                         if (p->contiguous_drift_confirm_sign != sign) {
                             p->contiguous_drift_confirm_sign = sign;
                             p->contiguous_drift_confirm_windows = 1;
                             p->contiguous_drift_confirm_sum_ppb = residual_ppb;
-                            window_state = "qualify-new";
                         } else {
                             p->contiguous_drift_confirm_windows++;
                             p->contiguous_drift_confirm_sum_ppb += residual_ppb;
-                            window_state = "qualify";
                         }
-
-                        confirm_sign_log = p->contiguous_drift_confirm_sign;
-                        confirm_windows_log = p->contiguous_drift_confirm_windows;
 
                         if (p->contiguous_drift_confirm_windows >=
                             drift_confirm_required)
                         {
-                            // Use the mean only after three consecutive windows
-                            // agree on direction. The quarter-step remains a
-                            // low-pass rate correction, never a phase correction.
-                            qualified_ppb = p->contiguous_drift_confirm_sum_ppb /
-                                            p->contiguous_drift_confirm_windows;
+                            int64_t qualified_ppb =
+                                p->contiguous_drift_confirm_sum_ppb /
+                                p->contiguous_drift_confirm_windows;
                             int64_t estimated_rate_ppb = old_rate_ppb + qualified_ppb;
                             if (estimated_rate_ppb > drift_max_rate_ppb)
                                 estimated_rate_ppb = drift_max_rate_ppb;
@@ -686,30 +609,14 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
                             if (rate_step_ppb < -drift_max_rate_step_ppb)
                                 rate_step_ppb = -drift_max_rate_step_ppb;
 
-                            if (rate_step_ppb != 0) {
+                            if (rate_step_ppb != 0)
                                 p->contiguous_drift_rate_ppb += rate_step_ppb;
-                                window_state = "rate-update-confirmed";
-                            } else {
-                                window_state = "hold-quantized";
-                            }
 
                             p->contiguous_drift_confirm_sign = 0;
                             p->contiguous_drift_confirm_windows = 0;
                             p->contiguous_drift_confirm_sum_ppb = 0;
                         }
                     }
-
-                    MP_INFO(ao,
-                            "FCI_AO_DRIFT_SERVO state=%s window_ms=%.3f "
-                            "phase_delta_ns=%lld residual_ppb=%lld qualified_ppb=%lld "
-                            "old_rate_ppb=%lld new_rate_ppb=%lld "
-                            "confirm_sign=%d confirm_windows=%d good_samples=%d\n",
-                            window_state, window_ns / 1e6,
-                            (long long)phase_delta, (long long)residual_ppb,
-                            (long long)qualified_ppb, (long long)old_rate_ppb,
-                            (long long)p->contiguous_drift_rate_ppb,
-                            confirm_sign_log, confirm_windows_log,
-                            p->contiguous_drift_good_samples);
 
                     p->contiguous_drift_anchor_now_ns = now;
                     p->contiguous_drift_anchor_phase_ns = phase_error;
@@ -718,57 +625,32 @@ static void reset_contiguous_clock_drift(struct buffer_state *p)
 
                 p->contiguous_drift_prev_now_ns = now;
                 p->contiguous_drift_prev_phase_ns = phase_error;
-                drift_state = "tracking";
             }
 
-            // Rate-only slew. At 500 ppm a normal 150 ms chunk changes by
-            // just 75 us. A hard 100 us per-pull cap is an additional guard.
             slew_ns = duration_ns * p->contiguous_drift_rate_ppb / 1000000000LL;
             int64_t max_slew_ns = 100 * 1000LL;
             if (slew_ns > max_slew_ns)
                 slew_ns = max_slew_ns;
             if (slew_ns < -max_slew_ns)
                 slew_ns = -max_slew_ns;
-
-            // Never manufacture an underrun merely to correct clock rate.
-            if (slew_ns < 0 && predicted_end + slew_ns < now + 1000 * 1000LL) {
+            if (slew_ns < 0 && predicted_end + slew_ns < now + 1000 * 1000LL)
                 slew_ns = 0;
-                drift_state = "hold-low-buffer";
-            }
 
             new_end = predicted_end + slew_ns;
         } else if (keep_contiguous && old_end > 0) {
-            mode = "reanchor-expired";
             reset_contiguous_clock_drift(p);
-            drift_state = "reset-expired";
         } else if (keep_contiguous) {
             reset_contiguous_clock_drift(p);
-            drift_state = "seed";
         }
 
         p->end_time_ns = new_end;
-        MP_INFO(ao,
-                "FCI_AO_ENDTIME_UPDATE samples=%d mode=%s old_end_ns=%lld "
-                "measured_end_ns=%lld predicted_end_ns=%lld new_end_ns=%lld "
-                "end_step_ns=%lld duration_ns=%lld phase_error_ns=%lld "
-                "slew_ns=%lld drift_rate_ppb=%lld drift_state=%s "
-                "drift_good_samples=%d drift_confirm_sign=%d "
-                "drift_confirm_windows=%d now_ns=%lld remaining_ms=%.3f\n",
-                pos, mode, (long long)old_end, (long long)measured_end,
-                (long long)predicted_end, (long long)new_end,
-                (long long)(new_end - old_end), (long long)duration_ns,
-                (long long)phase_error, (long long)slew_ns,
-                (long long)p->contiguous_drift_rate_ppb, drift_state,
-                p->contiguous_drift_good_samples,
-                p->contiguous_drift_confirm_sign,
-                p->contiguous_drift_confirm_windows, (long long)now,
-                (new_end - now) / 1e6);
     }'''
 
     fn = fn[:old_start] + endtime_block + fn[old_end:]
     src = src[:fn_start] + fn + src[fn_end:]
     p.write_text(src)
 PY_AUDIO_LONG_TERM_DRIFT
+
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
 # their target and performs one seek to the closest result in the requested
@@ -945,1148 +827,6 @@ new = "\n".join(lines)
 src = src[:line_start] + new + src[end:]
 path.write_text(src)
 PY_OSD_VIEWPORT
-
-# Pause/resume frame-continuity instrumentation. Keep the production video
-# behavior intact: no seek, queue reset, PTS rebase, acquisition-policy change,
-# or resume gate is introduced here. The records join media PTS, VO frame IDs,
-# libplacebo selection, AImage timestamps, EGL swaps, and pause epochs.
-python3 - <<'PY_FCI_MPV'
-from pathlib import Path
-
-
-def replace_once(text, old, new, label):
-    if text.count(old) != 1:
-        raise SystemExit(f"mpv FCI instrumentation failed at {label}: "
-                         f"expected one anchor, found {text.count(old)}")
-    return text.replace(old, new, 1)
-
-
-def load(path):
-    p = Path(path)
-    return p, p.read_text()
-
-
-# Player/core: record filtered-decoder output and the exact image selected for VO.
-p, src = load("player/video.c")
-if "FCI_CORE_FRAME_READY" not in src:
-    src = replace_once(
-        src,
-        '''    mp_assert(mpctx->num_next_frames < MP_ARRAY_SIZE(mpctx->next_frames));
-    mp_assert(frame);
-    mpctx->next_frames[mpctx->num_next_frames++] = frame;
-''',
-        '''    mp_assert(mpctx->num_next_frames < MP_ARRAY_SIZE(mpctx->next_frames));
-    mp_assert(frame);
-    MP_INFO(mpctx,
-            "FCI_CORE_FRAME_READY image=%p media_pts=%.9f pkt_duration=%.9f mp_ns=%"PRId64"\\n",
-            frame, frame->pts, frame->pkt_duration, mp_time_ns());
-    mpctx->next_frames[mpctx->num_next_frames++] = frame;
-''',
-        "core decoded/filtered frame",
-    )
-    src = replace_once(
-        src,
-        '''    mpctx->last_frame_duration =
-        mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
-
-    shift_frames(mpctx);
-''',
-        '''    mpctx->last_frame_duration =
-        mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
-
-    MP_INFO(mpctx,
-            "FCI_CORE_SELECT image=%p media_pts=%.9f target_ns=%"PRId64
-            " paused=%d future=%d mp_ns=%"PRId64"\\n",
-            frame->current, mpctx->video_pts, frame->pts, mpctx->paused,
-            frame->num_frames, mp_time_ns());
-    shift_frames(mpctx);
-''',
-        "core VO selection",
-    )
-    p.write_text(src)
-
-
-# Player pause boundary: this is the authoritative effective mpv pause state,
-# distinct from a UI command being accepted by the Android frontend.
-p, src = load("player/playloop.c")
-if "FCI_CORE_PAUSE" not in src:
-    src = replace_once(
-        src,
-        '''#include "osdep/timer.h"
-''',
-        '''#include "osdep/timer.h"
-#include <libavutil/time.h>
-''',
-        "shared monotonic clock include",
-    )
-    src = replace_once(
-        src,
-        '''void set_pause_state(struct MPContext *mpctx, bool user_pause)
-{
-    struct MPOpts *opts = mpctx->opts;
-
-    opts->pause = user_pause;
-''',
-        '''void set_pause_state(struct MPContext *mpctx, bool user_pause)
-{
-    struct MPOpts *opts = mpctx->opts;
-    static uint64_t fci_pause_transition;
-
-    opts->pause = user_pause;
-''',
-        "pause transition counter",
-    )
-    src = replace_once(
-        src,
-        '''    if (internal_paused != mpctx->paused) {
-        mpctx->paused = internal_paused;
-
-        if (mpctx->ao) {
-''',
-        '''    if (internal_paused != mpctx->paused) {
-        mpctx->paused = internal_paused;
-        uint64_t fci_transition = ++fci_pause_transition;
-        MP_INFO(mpctx,
-                "FCI_CORE_PAUSE transition=%llu state=%s user=%d cache=%d video_pts=%.9f mp_ns=%lld mono_us=%lld\\n",
-                (unsigned long long)fci_transition,
-                internal_paused ? "PAUSE" : "RESUME", user_pause,
-                mpctx->paused_for_cache, mpctx->video_pts,
-                (long long)mp_time_ns(), (long long)av_gettime_relative());
-
-        if (mpctx->ao) {
-''',
-        "effective pause marker",
-    )
-    p.write_text(src)
-
-
-# VO scheduler: identify every queued and rendered frame, and expose whether a
-# pause transition arrived while draw/flip was already in flight.
-p, src = load("video/out/vo.c")
-if "FCI_VO_QUEUE" not in src:
-    src = replace_once(
-        src,
-        '''    uint64_t current_frame_id;
-
-    double display_fps;
-''',
-        '''    uint64_t current_frame_id;
-    uint64_t fci_epoch;
-    uint64_t fci_render_seq;
-
-    double display_fps;
-''',
-        "VO trace fields",
-    )
-    src = replace_once(
-        src,
-        '''    frame->frame_id = ++(in->current_frame_id);
-    in->frame_queued = frame;
-''',
-        '''    frame->frame_id = ++(in->current_frame_id);
-    MP_INFO(vo,
-            "FCI_VO_QUEUE epoch=%llu id=%llu media_pts=%.9f target_ns=%lld duration_ns=%.0f paused=%d mp_ns=%lld\\n",
-            (unsigned long long)in->fci_epoch,
-            (unsigned long long)frame->frame_id,
-            frame->current ? frame->current->pts : MP_NOPTS_VALUE,
-            (long long)frame->pts, frame->duration, in->paused,
-            (long long)mp_time_ns());
-    in->frame_queued = frame;
-''',
-        "VO queue marker",
-    )
-    src = replace_once(
-        src,
-        '''    struct vo_frame *frame = NULL;
-    bool more_frames = false;
-
-    update_display_fps(vo);
-''',
-        '''    struct vo_frame *frame = NULL;
-    bool more_frames = false;
-    uint64_t fci_render_seq = 0;
-    uint64_t fci_render_epoch = 0;
-    uint64_t fci_frame_id = 0;
-    double fci_media_pts = MP_NOPTS_VALUE;
-
-    update_display_fps(vo);
-''',
-        "VO render trace locals",
-    )
-    src = replace_once(
-        src,
-        '''    frame = vo_frame_ref(in->current_frame);
-    mp_assert(frame);
-
-    if (frame->display_synced) {
-''',
-        '''    frame = vo_frame_ref(in->current_frame);
-    mp_assert(frame);
-    fci_render_seq = ++in->fci_render_seq;
-    fci_render_epoch = in->fci_epoch;
-    fci_frame_id = frame->frame_id;
-    fci_media_pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
-    MP_INFO(vo,
-            "FCI_VO_RENDER_SELECT render_seq=%llu epoch=%llu id=%llu media_pts=%.9f target_ns=%lld paused=%d mp_ns=%lld\\n",
-            (unsigned long long)fci_render_seq,
-            (unsigned long long)fci_render_epoch,
-            (unsigned long long)fci_frame_id, fci_media_pts,
-            (long long)frame->pts, in->paused, (long long)mp_time_ns());
-
-    if (frame->display_synced) {
-''',
-        "VO render selection",
-    )
-    src = replace_once(
-        src,
-        '''    if (in->dropped_frame) {
-        in->drop_count += 1;
-        wakeup_core(vo);
-    } else {
-        in->rendering = true;
-''',
-        '''    if (in->dropped_frame) {
-        MP_INFO(vo,
-                "FCI_VO_DROP render_seq=%llu epoch=%llu id=%llu media_pts=%.9f mp_ns=%lld\\n",
-                (unsigned long long)fci_render_seq,
-                (unsigned long long)fci_render_epoch,
-                (unsigned long long)fci_frame_id, fci_media_pts,
-                (long long)mp_time_ns());
-        in->drop_count += 1;
-        wakeup_core(vo);
-    } else {
-        MP_INFO(vo,
-                "FCI_VO_DRAW_BEGIN render_seq=%llu epoch=%llu id=%llu media_pts=%.9f mp_ns=%lld\\n",
-                (unsigned long long)fci_render_seq,
-                (unsigned long long)fci_render_epoch,
-                (unsigned long long)fci_frame_id, fci_media_pts,
-                (long long)mp_time_ns());
-        in->rendering = true;
-''',
-        "VO draw/drop boundary",
-    )
-    src = replace_once(
-        src,
-        '''        in->visible = vo->driver->draw_frame(vo, frame);
-
-        stats_time_end(in->stats, "video-draw");
-
-        wait_until(vo, target);
-''',
-        '''        in->visible = vo->driver->draw_frame(vo, frame);
-
-        stats_time_end(in->stats, "video-draw");
-        MP_INFO(vo,
-                "FCI_VO_DRAW_END render_seq=%llu epoch=%llu id=%llu visible=%d mp_ns=%lld\\n",
-                (unsigned long long)fci_render_seq,
-                (unsigned long long)fci_render_epoch,
-                (unsigned long long)fci_frame_id, in->visible,
-                (long long)mp_time_ns());
-
-        wait_until(vo, target);
-''',
-        "VO draw completion",
-    )
-    src = replace_once(
-        src,
-        '''        stats_time_start(in->stats, "video-flip");
-
-        vo->driver->flip_page(vo);
-
-        struct vo_vsync_info vsync = {
-''',
-        '''        stats_time_start(in->stats, "video-flip");
-        MP_INFO(vo,
-                "FCI_VO_FLIP_BEGIN render_seq=%llu epoch=%llu id=%llu target_ns=%lld mp_ns=%lld\\n",
-                (unsigned long long)fci_render_seq,
-                (unsigned long long)fci_render_epoch,
-                (unsigned long long)fci_frame_id, (long long)target,
-                (long long)mp_time_ns());
-
-        vo->driver->flip_page(vo);
-        MP_INFO(vo,
-                "FCI_VO_FLIP_END render_seq=%llu epoch=%llu id=%llu mp_ns=%lld\\n",
-                (unsigned long long)fci_render_seq,
-                (unsigned long long)fci_render_epoch,
-                (unsigned long long)fci_frame_id, (long long)mp_time_ns());
-
-        struct vo_vsync_info vsync = {
-''',
-        "VO flip boundary",
-    )
-    src = replace_once(
-        src,
-        '''        mp_mutex_lock(&in->lock);
-        in->dropped_frame = prev_drop_count < vo->in->drop_count;
-        in->rendering = false;
-
-        update_vsync_timing_after_swap(vo, &vsync);
-''',
-        '''        mp_mutex_lock(&in->lock);
-        MP_INFO(vo,
-                "FCI_VO_RENDER_END render_seq=%llu start_epoch=%llu end_epoch=%llu id=%llu paused=%d mp_ns=%lld\\n",
-                (unsigned long long)fci_render_seq,
-                (unsigned long long)fci_render_epoch,
-                (unsigned long long)in->fci_epoch,
-                (unsigned long long)fci_frame_id, in->paused,
-                (long long)mp_time_ns());
-        in->dropped_frame = prev_drop_count < vo->in->drop_count;
-        in->rendering = false;
-
-        update_vsync_timing_after_swap(vo, &vsync);
-''',
-        "VO post-swap epoch check",
-    )
-    old_pause = '''void vo_set_paused(struct vo *vo, bool paused)
-{
-    struct vo_internal *in = vo->in;
-    mp_mutex_lock(&in->lock);
-    if (in->paused != paused) {
-        in->paused = paused;
-        if (in->paused && in->dropped_frame) {
-            in->request_redraw = true;
-            wakeup_core(vo);
-        }
-        reset_vsync_timings(vo);
-        wakeup_locked(vo);
-    }
-    mp_mutex_unlock(&in->lock);
-}
-'''
-    new_pause = '''void vo_set_paused(struct vo *vo, bool paused)
-{
-    struct vo_internal *in = vo->in;
-    mp_mutex_lock(&in->lock);
-    if (in->paused != paused) {
-        in->paused = paused;
-        in->fci_epoch++;
-        MP_INFO(vo,
-                "FCI_VO_PAUSE epoch=%llu state=%s rendering=%d current_id=%llu current_media_pts=%.9f queued_id=%llu queued_media_pts=%.9f mp_ns=%lld\\n",
-                (unsigned long long)in->fci_epoch, paused ? "PAUSE" : "RESUME",
-                in->rendering,
-                (unsigned long long)(in->current_frame ? in->current_frame->frame_id : 0),
-                in->current_frame && in->current_frame->current
-                    ? in->current_frame->current->pts : MP_NOPTS_VALUE,
-                (unsigned long long)(in->frame_queued ? in->frame_queued->frame_id : 0),
-                in->frame_queued && in->frame_queued->current
-                    ? in->frame_queued->current->pts : MP_NOPTS_VALUE,
-                (long long)mp_time_ns());
-        if (in->paused && in->dropped_frame) {
-            in->request_redraw = true;
-            wakeup_core(vo);
-        }
-        reset_vsync_timings(vo);
-        wakeup_locked(vo);
-    }
-    mp_mutex_unlock(&in->lock);
-}
-'''
-    src = replace_once(src, old_pause, new_pause, "VO pause state")
-    src = replace_once(
-        src,
-        '''void vo_seek_reset(struct vo *vo)
-{
-    struct vo_internal *in = vo->in;
-    mp_mutex_lock(&in->lock);
-    forget_frames(vo);
-''',
-        '''void vo_seek_reset(struct vo *vo)
-{
-    struct vo_internal *in = vo->in;
-    mp_mutex_lock(&in->lock);
-    in->fci_epoch++;
-    MP_INFO(vo, "FCI_VO_RESET epoch=%llu mp_ns=%lld\\n",
-            (unsigned long long)in->fci_epoch, (long long)mp_time_ns());
-    forget_frames(vo);
-''',
-        "VO reset generation",
-    )
-    p.write_text(src)
-
-
-# AImageReader mapper: preserve acquireLatestImage exactly, but expose callback
-# count, source PTS, acquired AImage timestamp, and hardware-buffer identity.
-p, src = load("video/out/hwdec/hwdec_aimagereader.c")
-if "FCI_AIMAGE_CALLBACK" not in src:
-    src = replace_once(
-        src,
-        '''    media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
-    void (*AImage_delete)(AImage *);
-''',
-        '''    media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
-    media_status_t (*AImage_getTimestamp)(const AImage *, int64_t *);
-    void (*AImage_delete)(AImage *);
-''',
-        "AImage timestamp function pointer",
-    )
-    src = replace_once(
-        src,
-        '''    bool image_available;
-
-    EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
-''',
-        '''    bool image_available;
-    uint64_t image_callback_seq;
-    uint64_t map_seq;
-    uint64_t current_map_seq;
-    int64_t current_image_ts_ns;
-    AHardwareBuffer *current_hwbuf;
-
-    EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
-''',
-        "AImage trace fields",
-    )
-    src = replace_once(
-        src,
-        '''    { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
-    { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
-''',
-        '''    { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
-    { "AImage_getTimestamp", offsetof(struct priv_owner, AImage_getTimestamp) },
-    { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
-''',
-        "AImage timestamp symbol",
-    )
-    old_cb = '''    mp_mutex_lock(&p->lock);
-    p->image_available = true;
-    mp_cond_signal(&p->cond);
-    mp_mutex_unlock(&p->lock);
-'''
-    new_cb = '''    mp_mutex_lock(&p->lock);
-    p->image_available = true;
-    uint64_t callback_seq = ++p->image_callback_seq;
-    mp_cond_signal(&p->cond);
-    mp_mutex_unlock(&p->lock);
-    mp_info(p->log, "FCI_AIMAGE_CALLBACK callback_seq=%llu mp_ns=%lld\\n",
-            (unsigned long long)callback_seq, (long long)mp_time_ns());
-'''
-    src = replace_once(src, old_cb, new_cb, "AImage callback")
-    src = replace_once(
-        src,
-        '''    if (p->image) {
-        o->AImage_delete(p->image);
-        p->image = NULL;
-    }
-''',
-        '''    if (p->image) {
-        MP_INFO(mapper,
-                "FCI_AIMAGE_UNMAP map_seq=%llu image=%p image_ts_ns=%lld hwbuf=%p mp_ns=%lld\\n",
-                (unsigned long long)p->current_map_seq, p->image,
-                (long long)p->current_image_ts_ns, p->current_hwbuf,
-                (long long)mp_time_ns());
-        o->AImage_delete(p->image);
-        p->image = NULL;
-        p->current_hwbuf = NULL;
-    }
-''',
-        "AImage unmap",
-    )
-    old_release = '''    {
-        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
-            return -1;
-        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
-        av_mediacodec_release_buffer(buffer, 1);
-    }
-'''
-    new_release = '''    uint64_t map_seq = ++p->map_seq;
-    {
-        if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
-            return -1;
-        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
-        MP_INFO(mapper,
-                "FCI_AIMAGE_CODEC_RELEASE_BEGIN map_seq=%llu codec_buffer=%p source_media_pts=%.9f mp_ns=%lld\\n",
-                (unsigned long long)map_seq, buffer, mapper->src->pts,
-                (long long)mp_time_ns());
-        int release_ret = av_mediacodec_release_buffer(buffer, 1);
-        MP_INFO(mapper,
-                "FCI_AIMAGE_CODEC_RELEASE_END map_seq=%llu codec_buffer=%p result=%d mp_ns=%lld\\n",
-                (unsigned long long)map_seq, buffer, release_ret,
-                (long long)mp_time_ns());
-    }
-'''
-    src = replace_once(src, old_release, new_release, "MediaCodec-to-AImage release")
-    src = replace_once(
-        src,
-        '''    image_available = p->image_available;
-    p->image_available = false;
-    mp_mutex_unlock(&p->lock);
-
-    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-''',
-        '''    image_available = p->image_available;
-    uint64_t callback_seq = p->image_callback_seq;
-    p->image_available = false;
-    mp_mutex_unlock(&p->lock);
-
-    media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-''',
-        "AImage callback snapshot",
-    )
-    src = replace_once(
-        src,
-        '''    mp_assert(p->image);
-
-    AHardwareBuffer *hwbuf = NULL;
-''',
-        '''    mp_assert(p->image);
-
-    int64_t image_ts_ns = -1;
-    media_status_t ts_ret = o->AImage_getTimestamp(p->image, &image_ts_ns);
-
-    AHardwareBuffer *hwbuf = NULL;
-''',
-        "AImage timestamp read",
-    )
-    src = replace_once(
-        src,
-        '''    AHardwareBuffer_Desc d;
-    o->AHardwareBuffer_describe(hwbuf, &d);
-    if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
-''',
-        '''    AHardwareBuffer_Desc d;
-    o->AHardwareBuffer_describe(hwbuf, &d);
-    p->current_map_seq = map_seq;
-    p->current_image_ts_ns = image_ts_ns;
-    p->current_hwbuf = hwbuf;
-    MP_INFO(mapper,
-            "FCI_AIMAGE_ACQUIRE map_seq=%llu callback_seq=%llu source_media_pts=%.9f image=%p image_ts_status=%d image_ts_ns=%lld hwbuf=%p width=%u height=%u layers=%u format=%u stride=%u mp_ns=%lld\\n",
-            (unsigned long long)map_seq, (unsigned long long)callback_seq,
-            mapper->src->pts, p->image, ts_ret, (long long)image_ts_ns,
-            hwbuf, d.width, d.height, d.layers, d.format, d.stride,
-            (long long)mp_time_ns());
-    if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
-''',
-        "AImage acquisition identity",
-    )
-    p.write_text(src)
-
-
-# gpu-next/libplacebo: record queue insertion, lazy mapping, selected mix, and
-# the frame associated with each output swap. No queue state is changed.
-p, src = load("video/out/vo_gpu_next.c")
-if "FCI_GPU_DRAW_BEGIN" not in src:
-    src = replace_once(
-        src,
-        '''    bool frame_pending;
-    bool paused;
-
-    pl_options pars;
-''',
-        '''    bool frame_pending;
-    bool paused;
-    uint64_t fci_draw_seq;
-    uint64_t fci_pending_draw_seq;
-    uint64_t fci_pending_frame_id;
-    double fci_pending_media_pts;
-    uint64_t fci_swap_seq;
-
-    pl_options pars;
-''',
-        "gpu-next trace fields",
-    )
-    src = replace_once(
-        src,
-        '''struct frame_priv {
-    struct vo *vo;
-    struct osd_state subs;
-''',
-        '''struct frame_priv {
-    struct vo *vo;
-    uint64_t frame_id;
-    struct osd_state subs;
-''',
-        "libplacebo source frame ID",
-    )
-    src = replace_once(
-        src,
-        '''    struct frame_priv *fp = mpi->priv;
-    struct priv *p = fp->vo->priv;
-    if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
-''',
-        '''    struct frame_priv *fp = mpi->priv;
-    struct priv *p = fp->vo->priv;
-    MP_INFO(fp->vo,
-            "FCI_GPU_HWACQUIRE_BEGIN id=%llu media_pts=%.9f mp_ns=%lld\\n",
-            (unsigned long long)fp->frame_id, mpi->pts,
-            (long long)mp_time_ns());
-    if (!hwdec_reconfig(p, &p->hwdec_mapper, &p->hwdec_timer, fp->hwdec,
-''',
-        "gpu hardware acquire begin",
-    )
-    src = replace_once(
-        src,
-        '''    p->hwdec_perf = timer_pool_measure(p->hwdec_timer);
-    stats_time_end(p->stats, "hwdec-map");
-
-    return true;
-''',
-        '''    p->hwdec_perf = timer_pool_measure(p->hwdec_timer);
-    stats_time_end(p->stats, "hwdec-map");
-    MP_INFO(fp->vo,
-            "FCI_GPU_HWACQUIRE_END id=%llu media_pts=%.9f mp_ns=%lld\\n",
-            (unsigned long long)fp->frame_id, mpi->pts,
-            (long long)mp_time_ns());
-
-    return true;
-''',
-        "gpu hardware acquire end",
-    )
-    src = replace_once(
-        src,
-        '''    struct vo *vo = fp->vo;
-    struct priv *p = vo->priv;
-
-    fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
-''',
-        '''    struct vo *vo = fp->vo;
-    struct priv *p = vo->priv;
-    MP_INFO(vo,
-            "FCI_PL_MAP id=%llu media_pts=%.9f image=%p mp_ns=%lld\\n",
-            (unsigned long long)fp->frame_id, mpi->pts, mpi,
-            (long long)mp_time_ns());
-
-    fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
-''',
-        "libplacebo lazy map",
-    )
-    src = replace_once(
-        src,
-        '''    pl_gpu gpu = p->gpu;
-    update_options(vo);
-
-    struct pl_render_params params = pars->params;
-''',
-        '''    pl_gpu gpu = p->gpu;
-    update_options(vo);
-    uint64_t fci_draw_seq = ++p->fci_draw_seq;
-    p->fci_pending_draw_seq = fci_draw_seq;
-    p->fci_pending_frame_id = frame->current ? frame->frame_id : 0;
-    p->fci_pending_media_pts = frame->current
-        ? frame->current->pts : MP_NOPTS_VALUE;
-    MP_INFO(vo,
-            "FCI_GPU_DRAW_BEGIN draw_seq=%llu id=%llu media_pts=%.9f num_frames=%d paused_driver=%d mp_ns=%lld\\n",
-            (unsigned long long)fci_draw_seq,
-            (unsigned long long)p->fci_pending_frame_id,
-            p->fci_pending_media_pts, frame->num_frames, p->paused,
-            (long long)mp_time_ns());
-
-    struct pl_render_params params = pars->params;
-''',
-        "gpu draw begin",
-    )
-    src = replace_once(
-        src,
-        '''        if (p->want_reset) {
-            pl_queue_reset(p->queue);
-            p->last_pts = 0.0;
-''',
-        '''        if (p->want_reset) {
-            MP_INFO(vo,
-                    "FCI_PL_QUEUE_RESET draw_seq=%llu incoming_id=%d incoming_pts=%.9f mp_ns=%lld\\n",
-                    (unsigned long long)fci_draw_seq, id, frame->frames[n]->pts,
-                    (long long)mp_time_ns());
-            pl_queue_reset(p->queue);
-            p->last_pts = 0.0;
-''',
-        "libplacebo queue reset",
-    )
-    src = replace_once(
-        src,
-        '''        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
-        mpi->priv = fp;
-        fp->vo = vo;
-
-        pl_queue_push(p->queue, &(struct pl_source_frame) {
-''',
-        '''        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
-        mpi->priv = fp;
-        fp->vo = vo;
-        fp->frame_id = id;
-        MP_INFO(vo,
-                "FCI_PL_PUSH draw_seq=%llu id=%d media_pts=%.9f image=%p mp_ns=%lld\\n",
-                (unsigned long long)fci_draw_seq, id, mpi->pts, mpi,
-                (long long)mp_time_ns());
-
-        pl_queue_push(p->queue, &(struct pl_source_frame) {
-''',
-        "libplacebo queue push",
-    )
-    src = replace_once(
-        src,
-        '''        case PL_QUEUE_OK:
-            break;
-        }
-
-        // Update source crop and overlays on all existing frames. We
-''',
-        '''        case PL_QUEUE_OK:
-            break;
-        }
-
-        for (int i = 0; i < mix.num_frames; i++) {
-            const struct pl_frame *selected = mix.frames[i];
-            struct mp_image *selected_mpi = selected->user_data;
-            struct frame_priv *selected_fp = selected_mpi->priv;
-            MP_INFO(vo,
-                    "FCI_PL_SELECT draw_seq=%llu slot=%d count=%d id=%llu media_pts=%.9f rel_time=%.6f signature=%llu mp_ns=%lld\\n",
-                    (unsigned long long)fci_draw_seq, i, mix.num_frames,
-                    (unsigned long long)selected_fp->frame_id,
-                    selected_mpi->pts, mix.timestamps ? mix.timestamps[i] : 0.0f,
-                    (unsigned long long)(mix.signatures ? mix.signatures[i] : 0),
-                    (long long)mp_time_ns());
-        }
-
-        // Update source crop and overlays on all existing frames. We
-''',
-        "libplacebo selected mix",
-    )
-    src = replace_once(
-        src,
-        '''done:
-    if (!valid) // clear with purple to indicate error
-        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
-
-    pl_gpu_flush(gpu);
-''',
-        '''done:
-    if (!valid) // clear with purple to indicate error
-        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
-
-    MP_INFO(vo,
-            "FCI_GPU_DRAW_END draw_seq=%llu id=%llu media_pts=%.9f valid=%d mp_ns=%lld\\n",
-            (unsigned long long)fci_draw_seq,
-            (unsigned long long)p->fci_pending_frame_id,
-            p->fci_pending_media_pts, valid, (long long)mp_time_ns());
-    pl_gpu_flush(gpu);
-''',
-        "gpu draw end",
-    )
-    old_flip = '''static void flip_page(struct vo *vo)
-{
-    struct priv *p = vo->priv;
-    struct ra_swapchain *sw = p->ra_ctx->swapchain;
-
-    if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
-            MP_ERR(vo, "Failed presenting frame!\\n");
-        p->frame_pending = false;
-    }
-
-    sw->fns->swap_buffers(sw);
-}
-'''
-    new_flip = '''static void flip_page(struct vo *vo)
-{
-    struct priv *p = vo->priv;
-    struct ra_swapchain *sw = p->ra_ctx->swapchain;
-    uint64_t swap_seq = ++p->fci_swap_seq;
-    bool submitted = true;
-
-    MP_INFO(vo,
-            "FCI_GPU_SWAP_BEGIN swap_seq=%llu draw_seq=%llu id=%llu media_pts=%.9f pending=%d mp_ns=%lld\\n",
-            (unsigned long long)swap_seq,
-            (unsigned long long)p->fci_pending_draw_seq,
-            (unsigned long long)p->fci_pending_frame_id,
-            p->fci_pending_media_pts, p->frame_pending,
-            (long long)mp_time_ns());
-    if (p->frame_pending) {
-        submitted = pl_swapchain_submit_frame(p->sw);
-        if (!submitted)
-            MP_ERR(vo, "Failed presenting frame!\\n");
-        p->frame_pending = false;
-    }
-
-    sw->fns->swap_buffers(sw);
-    MP_INFO(vo,
-            "FCI_GPU_SWAP_END swap_seq=%llu draw_seq=%llu id=%llu media_pts=%.9f submitted=%d mp_ns=%lld\\n",
-            (unsigned long long)swap_seq,
-            (unsigned long long)p->fci_pending_draw_seq,
-            (unsigned long long)p->fci_pending_frame_id,
-            p->fci_pending_media_pts, submitted, (long long)mp_time_ns());
-}
-'''
-    src = replace_once(src, old_flip, new_flip, "gpu swap")
-    src = replace_once(
-        src,
-        '''    case VOCTRL_PAUSE:
-        if (p->is_interpolated)
-            vo->want_redraw = true;
-        p->paused = true;
-        return VO_TRUE;
-    case VOCTRL_RESUME:
-        p->paused = false;
-        return VO_TRUE;
-''',
-        '''    case VOCTRL_PAUSE:
-        MP_INFO(vo,
-                "FCI_GPU_CONTROL state=PAUSE pending_draw_seq=%llu pending_id=%llu pending_pts=%.9f mp_ns=%lld\\n",
-                (unsigned long long)p->fci_pending_draw_seq,
-                (unsigned long long)p->fci_pending_frame_id,
-                p->fci_pending_media_pts, (long long)mp_time_ns());
-        if (p->is_interpolated)
-            vo->want_redraw = true;
-        p->paused = true;
-        return VO_TRUE;
-    case VOCTRL_RESUME:
-        MP_INFO(vo,
-                "FCI_GPU_CONTROL state=RESUME pending_draw_seq=%llu pending_id=%llu pending_pts=%.9f mp_ns=%lld\\n",
-                (unsigned long long)p->fci_pending_draw_seq,
-                (unsigned long long)p->fci_pending_frame_id,
-                p->fci_pending_media_pts, (long long)mp_time_ns());
-        p->paused = false;
-        return VO_TRUE;
-''',
-        "gpu pause control arrival",
-    )
-    src = replace_once(
-        src,
-        '''    case VOCTRL_RESET:
-        // Defer until the first new frame (unique ID) actually arrives
-        p->want_reset = true;
-        return VO_TRUE;
-''',
-        '''    case VOCTRL_RESET:
-        MP_INFO(vo, "FCI_GPU_RESET_REQUEST mp_ns=%lld\\n",
-                (long long)mp_time_ns());
-        // Defer until the first new frame (unique ID) actually arrives
-        p->want_reset = true;
-        return VO_TRUE;
-''',
-        "gpu reset request",
-    )
-    p.write_text(src)
-
-
-# Android EGL producer: record the actual eglSwapBuffers return. mpv does not
-# use EGL_ANDROID_presentation_time here, and this build intentionally does not
-# start using it because that would change scheduling behavior under test.
-p, src = load("video/out/opengl/context_android.c")
-if "FCI_EGL_SWAP" not in src:
-    src = replace_once(
-        src,
-        '''#include "common/common.h"
-#include "context.h"
-''',
-        '''#include "common/common.h"
-#include "osdep/timer.h"
-#include "context.h"
-''',
-        "Android EGL monotonic clock include",
-    )
-    src = replace_once(
-        src,
-        '''    EGLContext egl_context;
-    EGLSurface egl_surface;
-};
-''',
-        '''    EGLContext egl_context;
-    EGLSurface egl_surface;
-    uint64_t fci_swap_seq;
-};
-''',
-        "Android EGL swap counter",
-    )
-    src = replace_once(
-        src,
-        '''static void android_swap_buffers(struct ra_ctx *ctx)
-{
-    struct priv *p = ctx->priv;
-    eglSwapBuffers(p->egl_display, p->egl_surface);
-}
-''',
-        '''static void android_swap_buffers(struct ra_ctx *ctx)
-{
-    struct priv *p = ctx->priv;
-    uint64_t swap_seq = ++p->fci_swap_seq;
-    int64_t begin = mp_time_ns();
-    EGLBoolean ok = eglSwapBuffers(p->egl_display, p->egl_surface);
-    EGLint error = ok ? EGL_SUCCESS : eglGetError();
-    MP_INFO(ctx,
-            "FCI_EGL_SWAP swap_seq=%llu result=%d egl_error=0x%x presentation_ts=unset begin_mp_ns=%lld end_mp_ns=%lld\\n",
-            (unsigned long long)swap_seq, ok, error,
-            (long long)begin, (long long)mp_time_ns());
-}
-''',
-        "Android EGL swap",
-    )
-    p.write_text(src)
-PY_FCI_MPV
-
-# Second-stage A/V clock instrumentation. The existing FCI markers already
-# localize the visible continuity loss to core-generated presentation targets.
-# This block only exposes the values that create those targets and AudioTrack's
-# reported delay state. It deliberately does not change pause/seek/video timing.
-#
-# Keep these injections deliberately tolerant of harmless upstream whitespace
-# and line-wrap changes: mpv-android fetches mpv master at build time.
-python3 - <<'PY_FCI_AVSYNC_AUDIO'
-from pathlib import Path
-import re
-
-
-def function_span(text, signature, label):
-    starts = [m.start() for m in re.finditer(re.escape(signature), text)]
-    if len(starts) != 1:
-        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
-                         f"expected one function signature, found {len(starts)}")
-    start = starts[0]
-    brace = text.find("{", start + len(signature))
-    if brace < 0:
-        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
-                         "opening brace not found")
-    depth = 0
-    for i in range(brace, len(text)):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return start, i + 1
-    raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
-                     "closing brace not found")
-
-
-def regex_once(text, pattern, repl, label, flags=0):
-    rx = re.compile(pattern, flags)
-    matches = list(rx.finditer(text))
-    if len(matches) != 1:
-        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
-                         f"expected one anchor, found {len(matches)}")
-    return rx.sub(repl, text, count=1)
-
-
-def regex_in_function(text, signature, pattern, repl, label, flags=0):
-    start, end = function_span(text, signature, label)
-    fn = text[start:end]
-    fn = regex_once(fn, pattern, repl, label, flags)
-    return text[:start] + fn + text[end:]
-
-
-def replace_in_function(text, signature, old, new, label):
-    start, end = function_span(text, signature, label)
-    fn = text[start:end]
-    count = fn.count(old)
-    if count != 1:
-        raise SystemExit(f"mpv A/V clock instrumentation failed at {label}: "
-                         f"expected one anchor, found {count}")
-    fn = fn.replace(old, new, 1)
-    return text[:start] + fn + text[end:]
-
-
-# Core: expose the exact audio-derived rewrite that determines the next video
-# presentation deadline. Match semantic assignment lines instead of a brittle
-# multi-line literal block.
-p = Path("player/video.c")
-src = p.read_text()
-if "FCI_AVSYNC_REWRITE" not in src:
-    src = regex_in_function(
-        src,
-        "static void update_avsync_before_frame(struct MPContext *mpctx)",
-        r'(?m)^(?P<i>[ \t]*)double[ \t]+buffered_audio[ \t]*=[ \t]*ao_get_delay\(mpctx->ao\);[ \t]*$',
-        lambda m: (m.group('i') + 'double fci_time_frame_before = mpctx->time_frame;\n' +
-                   m.group('i') + 'double fci_delay_before = mpctx->delay;\n' +
-                   m.group(0)),
-        "video avsync input",
-    )
-    avsync_log = '''MP_INFO(mpctx,
-                "FCI_AVSYNC_REWRITE video_pts=%.9f audio_status=%d video_status=%d "
-                "time_frame_before=%.9f buffered_audio=%.9f delay_before=%.9f "
-                "delay_after=%.9f video_speed=%.9f predicted=%.9f difference=%.9f "
-                "autosync=%d time_frame_after=%.9f mp_ns=%lld\\n",
-                mpctx->video_pts, mpctx->audio_status, mpctx->video_status,
-                fci_time_frame_before, buffered_audio, fci_delay_before,
-                mpctx->delay, mpctx->video_speed, predicted, difference,
-                opts->autosync, mpctx->time_frame, (long long)mp_time_ns());'''
-    src = regex_in_function(
-        src,
-        "static void update_avsync_before_frame(struct MPContext *mpctx)",
-        r'(?m)^(?P<i>[ \t]*)mpctx->time_frame[ \t]*=[ \t]*buffered_audio[ \t]*-[ \t]*mpctx->delay[ \t]*/[ \t]*mpctx->video_speed[ \t]*;[ \t]*$',
-        lambda m: m.group(0) + '\n' + m.group('i') + avsync_log,
-        "video avsync result",
-    )
-    p.write_text(src)
-
-
-# Generic AO wrapper: record asynchronous end-time updates used by pull AOs,
-# then split ao_get_delay() into its end-time and software-queue components.
-# Returned timing values are unchanged.
-p = Path("audio/out/buffer.c")
-src = p.read_text()
-if "FCI_AO_ENDTIME_UPDATE" not in src:
-    endtime_block = '''if (pos > 0) {
-        int64_t fci_old_end = p->end_time_ns;
-        p->end_time_ns = out_time_ns;
-        int64_t fci_now = mp_time_ns();
-        MP_INFO(ao,
-                "FCI_AO_ENDTIME_UPDATE samples=%d old_end_ns=%lld new_end_ns=%lld "
-                "end_step_ns=%lld now_ns=%lld remaining_ms=%.3f\\n",
-                pos, (long long)fci_old_end, (long long)p->end_time_ns,
-                (long long)(p->end_time_ns - fci_old_end),
-                (long long)fci_now,
-                (p->end_time_ns - fci_now) / 1e6);
-    }'''
-    src = regex_in_function(
-        src,
-        "static int ao_read_data_locked(struct ao *ao, void **data, int samples,",
-        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(pos[ \t]*>[ \t]*0\)[ \t]*\n[ \t]+p->end_time_ns[ \t]*=[ \t]*out_time_ns;[ \t]*$',
-        lambda m: m.group('i') + endtime_block,
-        "pull ao end-time update",
-    )
-
-if "FCI_AO_DELAY" not in src:
-    # Do not replace the whole pending/return block: upstream has changed that
-    # formatting more than once. ao_get_delay() has one unlock after it has
-    # computed both driver_delay and pending; copy state immediately before
-    # that unlock, log after unlocking, and leave the original return intact.
-    delay_probe = r'''double fci_pending_delay = pending / (double)ao->samplerate;
-    double fci_total_delay = driver_delay + fci_pending_delay;
-    bool fci_playing = p->playing;
-    bool fci_paused = p->paused;
-    bool fci_streaming = p->streaming;
-    bool fci_hw_paused = p->hw_paused;
-    int64_t fci_end_time = p->end_time_ns;
-    mp_mutex_unlock(&p->lock);
-    MP_INFO(ao,
-            "FCI_AO_DELAY source=%s device_or_end=%.9f end_time_ns=%lld "
-            "pending_samples=%lld pending_delay=%.9f total=%.9f "
-            "playing=%d paused=%d streaming=%d hw_paused=%d mp_ns=%lld\n",
-            ao->driver->write ? "driver" : "endtime", driver_delay,
-            (long long)fci_end_time, (long long)pending, fci_pending_delay,
-            fci_total_delay, fci_playing, fci_paused, fci_streaming,
-            fci_hw_paused, (long long)mp_time_ns());'''
-    src = regex_in_function(
-        src,
-        "double ao_get_delay(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)mp_mutex_unlock\(&p->lock\);[ \t]*$',
-        lambda m: m.group('i') + delay_probe,
-        "generic ao delay unlock",
-    )
-    p.write_text(src)
-
-
-# Android AudioTrack: expose the state used to produce the driver's delay.
-# Preserve the original single getLatency() JNI call and all return semantics.
-p = Path("audio/out/ao_audiotrack.c")
-src = p.read_text()
-if "FCI_AT_LATENCY" not in src:
-    # Keep AudioTrack_getLatency() behavior byte-for-byte equivalent: do not
-    # make an extra Java getLatency() call and do not replace its return path.
-    # Snapshot state around the existing playback-head call, remember the base
-    # delay, then log the final raw delay immediately before its existing clamp.
-    src = regex_in_function(
-        src,
-        "static double AudioTrack_getLatency(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)uint32_t[ \t]+playhead[ \t]*=[ \t]*AudioTrack_getPlaybackHeadPosition\(ao\);[ \t]*$',
-        lambda m: (m.group('i') + 'bool fci_ts_before = p->timestamp_set;\n' +
-                   m.group('i') + 'int fci_stable_before = p->timestamp_stable;\n' +
-                   m.group('i') + 'int64_t fci_fetched_before = p->timestamp_fetched;\n' +
-                   m.group('i') + 'uint32_t fci_raw_before = p->playhead_pos;\n' +
-                   m.group(0) + '\n' +
-                   m.group('i') + 'bool fci_ts_after = p->timestamp_set;'),
-        "AudioTrack latency playhead",
-    )
-    src = regex_in_function(
-        src,
-        "static double AudioTrack_getLatency(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)double[ \t]+delay[ \t]*=[ \t]*diff[ \t]*/[ \t]*\(double\)\(?ao->samplerate\)?;[ \t]*$',
-        lambda m: m.group(0) + '\n' + m.group('i') + 'double fci_base_delay = delay;',
-        "AudioTrack latency base",
-    )
-    latency_log = r'''double fci_java_component = delay - fci_base_delay;
-    double fci_result = delay > 2.0 ? 0.0 : MPCLAMP(delay, 0.0, 2.0);
-    MP_INFO(ao,
-            "FCI_AT_LATENCY written=%u playhead=%u diff=%u base=%.9f "
-            "java_component=%.9f total_raw=%.9f result=%.9f "
-            "ts_before=%d ts_after=%d stable_before=%d stable_after=%d "
-            "fetched_before=%lld fetched_after=%lld raw_playhead_before=%u "
-            "raw_playhead_after=%u playhead_offset=%u reset_pending=%d "
-            "pending_bytes=%d raw_ns=%lld\n",
-            p->written_frames, playhead, diff, fci_base_delay,
-            fci_java_component, delay, fci_result, fci_ts_before, fci_ts_after,
-            fci_stable_before, p->timestamp_stable,
-            (long long)fci_fetched_before, (long long)p->timestamp_fetched,
-            fci_raw_before, p->playhead_pos, p->playhead_offset,
-            p->reset_pending, p->pending_bytes, (long long)mp_raw_time_ns());'''
-    src = regex_in_function(
-        src,
-        "static double AudioTrack_getLatency(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(delay[ \t]*>[ \t]*2\.0\)[ \t]*\{[ \t]*$',
-        lambda m: m.group('i') + latency_log + '\n' + m.group(0),
-        "AudioTrack latency final",
-    )
-
-# set_pause() is introduced by the hardware-pause patch above, so its body is
-# under our control. Do not read thread-owned counters here without its mutex.
-if "FCI_AT_SET_PAUSE" not in src:
-    src = replace_in_function(
-        src,
-        "static bool set_pause(struct ao *ao, bool paused)",
-        '''    // Do not take p->lock here. The audio thread holds it while blocked in
-    // AudioTrack.write(), and pause() is what interrupts that write.
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-''',
-        '''    // Do not take p->lock here. The audio thread holds it while blocked in
-    // AudioTrack.write(), and pause() is what interrupts that write.
-    MP_INFO(ao, "FCI_AT_SET_PAUSE phase=before action=%s raw_ns=%lld\\n",
-            paused ? "PAUSE" : "RESUME", (long long)mp_raw_time_ns());
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-''',
-        "AudioTrack pause before",
-    )
-    pause_after_log = '''MP_INFO(ao, "FCI_AT_SET_PAUSE phase=after action=%s raw_ns=%lld\\n",
-            paused ? "PAUSE" : "RESUME", (long long)mp_raw_time_ns());'''
-    src = regex_in_function(
-        src,
-        "static bool set_pause(struct ao *ao, bool paused)",
-        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(MP_JNI_EXCEPTION_LOG\(ao\)[ \t]*<[ \t]*0\)[ \t]*\n[ \t]+return[ \t]+false;[ \t]*\n(?P<blank>[ \t]*\n)?(?P=i)if[ \t]*\(!paused\)[ \t]*$',
-        lambda m: (m.group('i') + 'if (MP_JNI_EXCEPTION_LOG(ao) < 0)\n' +
-                   m.group('i') + '    return false;\n\n' +
-                   m.group('i') + pause_after_log + '\n\n' +
-                   m.group('i') + 'if (!paused)'),
-        "AudioTrack pause after",
-    )
-
-# stop() is the reset/seek path. Read its mutable counters only while p->lock
-# is held, so diagnostics do not add a data race to the AudioTrack thread.
-if "FCI_AT_RESET" not in src:
-    src = replace_in_function(
-        src,
-        "static void stop(struct ao *ao)",
-        '''    mp_mutex_lock(&p->lock);
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
-''',
-        '''    mp_mutex_lock(&p->lock);
-    MP_INFO(ao,
-            "FCI_AT_RESET phase=before_flush written=%u pending_bytes=%d "
-            "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
-            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
-            p->written_frames, p->pending_bytes, p->timestamp_set,
-            p->timestamp_stable, (long long)p->timestamp_fetched,
-            p->playhead_pos, p->playhead_offset, p->reset_pending,
-            (long long)mp_raw_time_ns());
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
-''',
-        "AudioTrack reset before flush",
-    )
-    reset_after_log = r'''MP_INFO(ao,
-            "FCI_AT_RESET phase=after_reset written=%u pending_bytes=%d "
-            "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
-            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\n",
-            p->written_frames, p->pending_bytes, p->timestamp_set,
-            p->timestamp_stable, (long long)p->timestamp_fetched,
-            p->playhead_pos, p->playhead_offset, p->reset_pending,
-            (long long)mp_raw_time_ns());'''
-    src = regex_in_function(
-        src,
-        "static void stop(struct ao *ao)",
-        r'(?m)^(?P<i>[ \t]*)mp_mutex_unlock\(&p->lock\);[ \t]*$',
-        lambda m: m.group('i') + reset_after_log + '\n' + m.group(0),
-        "AudioTrack reset after",
-    )
-
-p.write_text(src)
-PY_FCI_AVSYNC_AUDIO
 
 unset CC CXX # meson wants these unset
 
