@@ -146,6 +146,273 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 PATCH
 fi
 
+# Keep AudioTrack's pull-AO clock continuous across pause/resume and seek.
+#
+# Android documents getTimestamp() as a clock that must be warmed up after
+# startup/mode transitions until successive timestamps show an advancing frame
+# position. The upstream AudioTrack AO marks the timestamp usable as soon as one
+# timestamp is returned, which lets a transient anchor rewrite the pull-AO
+# end_time in one step. Also, the AO currently computes out_time for the full
+# requested chunk before ao_read_data() tells it how many samples were actually
+# available; a short read therefore overstates the end time.
+#
+# This patch does two things at the clock source:
+#   1. Use playbackHeadPosition + AudioTrack.getLatency() until a timestamp
+#      baseline is followed by an advancing AudioTimestamp. Re-arm that warmup after
+#      every AudioTrack start/resume and after reset.
+#   2. Add a pull-AO helper whose timestamp is the start of the returned audio,
+#      so buffer.c derives end_time from the *actual* number of samples read.
+#
+# No video timing, frame dropping, decoder, AImageReader, GPU, or artificial
+# delay is changed here.
+python3 - <<'PY_AUDIO_CLOCK_CONTINUITY'
+from pathlib import Path
+import re
+
+
+def function_span(text, signature, label):
+    starts = [m.start() for m in re.finditer(re.escape(signature), text)]
+    if len(starts) != 1:
+        raise SystemExit(f"AudioTrack clock fix failed at {label}: "
+                         f"expected one function signature, found {len(starts)}")
+    start = starts[0]
+    brace = text.find("{", start + len(signature))
+    if brace < 0:
+        raise SystemExit(f"AudioTrack clock fix failed at {label}: opening brace not found")
+    depth = 0
+    for i in range(brace, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    raise SystemExit(f"AudioTrack clock fix failed at {label}: closing brace not found")
+
+
+def regex_once(text, pattern, repl, label, flags=0):
+    rx = re.compile(pattern, flags)
+    matches = list(rx.finditer(text))
+    if len(matches) != 1:
+        raise SystemExit(f"AudioTrack clock fix failed at {label}: "
+                         f"expected one anchor, found {len(matches)}")
+    return rx.sub(repl, text, count=1)
+
+
+def regex_in_function(text, signature, pattern, repl, label, flags=0):
+    start, end = function_span(text, signature, label)
+    fn = text[start:end]
+    fn = regex_once(fn, pattern, repl, label, flags)
+    return text[:start] + fn + text[end:]
+
+
+# Expose a pull-AO read variant where the caller provides the time at which the
+# first returned sample reaches the device. buffer.c can then add the duration
+# of the actual returned sample count while still holding its lock.
+p = Path("audio/out/internal.h")
+src = p.read_text()
+if "ao_read_data_with_start_time" not in src:
+    src = regex_once(
+        src,
+        r'(?m)^(?P<i>[ \t]*)int ao_read_data\(struct ao \*ao, void \*\*data, int samples, int64_t out_time_ns, bool \*eof, bool pad_silence, bool blocking\);[ \t]*$',
+        lambda m: m.group(0) + '\n' + m.group('i') +
+            'int ao_read_data_with_start_time(struct ao *ao, void **data, int samples,\n' +
+            m.group('i') + '                                 int64_t out_start_time_ns, bool *eof,\n' +
+            m.group('i') + '                                 bool pad_silence, bool blocking);',
+        "internal pull-AO prototype",
+    )
+    p.write_text(src)
+
+
+p = Path("audio/out/buffer.c")
+src = p.read_text()
+if "ao_read_data_with_start_time" not in src:
+    src = regex_once(
+        src,
+        r'static int ao_read_data_locked\(struct ao \*ao, void \*\*data, int samples,\n(?P<i>[ \t]*)int64_t out_time_ns, bool \*eof, bool pad_silence\)',
+        lambda m: 'static int ao_read_data_locked(struct ao *ao, void **data, int samples,\n' +
+                  m.group('i') + 'int64_t out_time_ns, bool out_time_is_start,\n' +
+                  m.group('i') + 'bool *eof, bool pad_silence)',
+        "buffer locked signature",
+    )
+
+    endtime_repl = r'''if (pos > 0) {
+        int64_t fci_old_end = p->end_time_ns;
+        if (out_time_is_start)
+            out_time_ns += MP_TIME_S_TO_NS(pos / (double)ao->samplerate);
+        p->end_time_ns = out_time_ns;
+        int64_t fci_now = mp_time_ns();
+        MP_INFO(ao,
+                "FCI_AO_ENDTIME_UPDATE samples=%d old_end_ns=%lld new_end_ns=%lld "
+                "end_step_ns=%lld now_ns=%lld remaining_ms=%.3f\n",
+                pos, (long long)fci_old_end, (long long)p->end_time_ns,
+                (long long)(p->end_time_ns - fci_old_end),
+                (long long)fci_now,
+                (p->end_time_ns - fci_now) / 1e6);
+    }'''
+    src = regex_in_function(
+        src,
+        "static int ao_read_data_locked(struct ao *ao, void **data, int samples,",
+        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(pos[ \t]*>[ \t]*0\)[ \t]*\n[ \t]+p->end_time_ns[ \t]*=[ \t]*out_time_ns;[ \t]*$',
+        lambda m: m.group('i') + endtime_repl,
+        "buffer end-time assignment",
+    )
+
+    src = regex_in_function(
+        src,
+        "int ao_read_data(struct ao *ao, void **data, int samples,",
+        r'ao_read_data_locked\(ao, data, samples, out_time_ns, eof, pad_silence\)',
+        'ao_read_data_locked(ao, data, samples, out_time_ns, false, eof, pad_silence)',
+        "existing ao_read_data call",
+    )
+
+    start, end = function_span(
+        src,
+        "int ao_read_data(struct ao *ao, void **data, int samples,",
+        "ao_read_data function",
+    )
+    helper = r'''
+
+// Same locking/underrun semantics as ao_read_data(), but out_start_time_ns is
+// the expected output time of the first returned sample. This lets the common
+// buffer derive end_time from the number of samples that were actually read.
+int ao_read_data_with_start_time(struct ao *ao, void **data, int samples,
+                                 int64_t out_start_time_ns, bool *eof,
+                                 bool pad_silence, bool blocking)
+{
+    struct buffer_state *p = ao->buffer_state;
+    if (blocking) {
+        mp_mutex_lock(&p->lock);
+    } else if (mp_mutex_trylock(&p->lock)) {
+        return 0;
+    }
+
+    bool eof_buf;
+    if (eof == NULL)
+        eof = &eof_buf;
+
+    int pos = ao_read_data_locked(ao, data, samples, out_start_time_ns, true,
+                                  eof, pad_silence);
+
+    mp_mutex_unlock(&p->lock);
+    return pos;
+}
+'''
+    src = src[:end] + helper + src[end:]
+    p.write_text(src)
+
+
+p = Path("audio/out/ao_audiotrack.c")
+src = p.read_text()
+if "AudioTrack_timestampValid" not in src:
+    src = regex_once(
+        src,
+        r'(?m)^(?P<i>[ \t]*)int pending_bytes;[ \t]*$',
+        lambda m: m.group(0) + '\n' + m.group('i') + 'atomic_bool timestamp_rearm;',
+        "AudioTrack timestamp rearm field",
+    )
+
+    sig = "static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)"
+    fstart, _ = function_span(src, sig, "AudioTrack playback head")
+    helper = '''static bool AudioTrack_timestampValid(struct priv *p)
+{
+    return p->timestamp_set && p->timestamp_stable >= 1;
+}
+
+'''
+    src = src[:fstart] + helper + src[fstart:]
+
+    src = regex_in_function(
+        src,
+        sig,
+        r'(?m)^(?P<i>[ \t]*)if[ \t]*\(!p->audiotrack\)[ \t]*\n(?P=i)[ \t]+return 0;[ \t]*$',
+        lambda m: m.group(0) + '\n' + m.group('i') + '''if (atomic_exchange(&p->timestamp_rearm, false)) {
+        p->timestamp_fetched = 0;
+        p->timestamp_set = false;
+        p->timestamp_stable = 0;
+    }''',
+        "AudioTrack consume timestamp rearm",
+    )
+
+    src = regex_in_function(
+        src,
+        sig,
+        r'(?m)^(?P<i>[ \t]*)int64_t time1 = MP_JNI_GET_LONG\(p->timestamp, AudioTimestamp\.nanoTime\);[ \t]*$',
+        lambda m: (m.group('i') + 'uint32_t fpos1 = 0xFFFFFFFFL & MP_JNI_GET_LONG(\n' +
+                   m.group('i') + '    p->timestamp, AudioTimestamp.framePosition);\n' +
+                   m.group(0) + '\n' + m.group('i') +
+                   'bool had_timestamp = p->timestamp_set;'),
+        "AudioTrack previous timestamp position",
+    )
+
+    src = regex_in_function(
+        src,
+        sig,
+        r'(?m)^(?P<i>[ \t]*)if \(time1 != time2 && time2 != 0 && fpos != 0\) \{[ \t]*\n(?P=i)[ \t]+p->timestamp_stable\+\+;[ \t]*\n(?P=i)\}[ \t]*$',
+        lambda m: (m.group('i') +
+                   'if (had_timestamp && time1 != time2 && time2 != 0 && fpos != 0 && fpos != fpos1) {\n' +
+                   m.group('i') + '    p->timestamp_stable++;\n' +
+                   m.group('i') + '} else {\n' +
+                   m.group('i') + '    p->timestamp_stable = 0;\n' +
+                   m.group('i') + '}'),
+        "AudioTrack advancing timestamp test",
+    )
+
+    src = regex_in_function(
+        src,
+        sig,
+        r'(?m)^(?P<i>[ \t]*)if \(p->timestamp_set\) \{[ \t]*$',
+        lambda m: m.group('i') + 'if (AudioTrack_timestampValid(p)) {',
+        "AudioTrack timestamp authority",
+    )
+
+    src = regex_in_function(
+        src,
+        "static double AudioTrack_getLatency(struct ao *ao)",
+        r'(?m)^(?P<i>[ \t]*)if \(!p->timestamp_set &&[ \t]*$',
+        lambda m: m.group('i') + 'if (!AudioTrack_timestampValid(p) &&',
+        "AudioTrack latency fallback",
+    )
+
+    src = regex_in_function(
+        src,
+        "static MP_THREAD_VOID ao_thread(void *arg)",
+        r'(?m)^(?P<i>[ \t]*)ts \+= MP_TIME_S_TO_NS\(read_samples / \(double\)\(ao->samplerate\)\);[ \t]*\n',
+        '',
+        "AudioTrack requested-duration removal",
+    )
+    src = regex_in_function(
+        src,
+        "static MP_THREAD_VOID ao_thread(void *arg)",
+        r'ao_read_data\(ao, &p->chunk, read_samples, ts,',
+        'ao_read_data_with_start_time(ao, &p->chunk, read_samples, ts,',
+        "AudioTrack actual-sample timed read",
+    )
+
+    src = regex_in_function(
+        src,
+        "static bool set_pause(struct ao *ao, bool paused)",
+        r'(?m)^(?P<i>[ \t]*)if \(MP_JNI_EXCEPTION_LOG\(ao\) < 0\)[ \t]*\n(?P=i)[ \t]+return false;[ \t]*$',
+        lambda m: (m.group(0) + '\n\n' + m.group('i') +
+                   'if (!paused)\n' + m.group('i') +
+                   '    atomic_store(&p->timestamp_rearm, true);'),
+        "AudioTrack resume timestamp rearm",
+    )
+
+    src = regex_in_function(
+        src,
+        "static void stop(struct ao *ao)",
+        r'(?m)^(?P<i>[ \t]*)p->timestamp_set = false;[ \t]*$',
+        lambda m: (m.group(0) + '\n' + m.group('i') +
+                   'p->timestamp_stable = 0;\n' + m.group('i') +
+                   'atomic_store(&p->timestamp_rearm, false);'),
+        "AudioTrack reset timestamp state",
+    )
+
+    p.write_text(src)
+PY_AUDIO_CLOCK_CONTINUITY
+
 # Make subtitle seeking treat the primary and secondary tracks as one timeline.
 # mpv exposes per-track seeking, so add a "both" mode which asks both tracks for
 # their target and performs one seek to the closest result in the requested
@@ -1446,25 +1713,19 @@ if "FCI_AT_RESET" not in src:
 ''',
         "AudioTrack reset before flush",
     )
-    src = replace_in_function(
-        src,
-        "static void stop(struct ao *ao)",
-        '''    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    mp_mutex_unlock(&p->lock);
-''',
-        '''    p->timestamp_fetched = 0;
-    p->timestamp_set = false;
-    MP_INFO(ao,
+    reset_after_log = r'''MP_INFO(ao,
             "FCI_AT_RESET phase=after_reset written=%u pending_bytes=%d "
             "timestamp_set=%d timestamp_stable=%d timestamp_fetched=%lld "
-            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\\n",
+            "playhead_pos=%u playhead_offset=%u reset_pending=%d raw_ns=%lld\n",
             p->written_frames, p->pending_bytes, p->timestamp_set,
             p->timestamp_stable, (long long)p->timestamp_fetched,
             p->playhead_pos, p->playhead_offset, p->reset_pending,
-            (long long)mp_raw_time_ns());
-    mp_mutex_unlock(&p->lock);
-''',
+            (long long)mp_raw_time_ns());'''
+    src = regex_in_function(
+        src,
+        "static void stop(struct ao *ao)",
+        r'(?m)^(?P<i>[ \t]*)mp_mutex_unlock\(&p->lock\);[ \t]*$',
+        lambda m: m.group('i') + reset_after_log + '\n' + m.group(0),
         "AudioTrack reset after",
     )
 
