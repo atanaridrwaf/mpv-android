@@ -463,7 +463,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         binding = PlayerBinding.inflate(layoutInflater)
         gestures = TouchGestures(this)
-        zoomGestures = VideoZoomGestures(binding.player)
+        zoomGestures = VideoZoomGestures(binding.player) { scale, active ->
+            showZoomGestureFeedback(scale, active)
+        }
         binding.player.onSurfaceTextureFrameAvailable = {
             playerSurfaceFrameSerial += 1L
             onScrubSurfaceFrameAvailable(playerSurfaceFrameSerial)
@@ -4577,6 +4579,21 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         fadeHandler.postDelayed(fadeRunnable3, 500L)
     }
 
+    private fun showZoomGestureFeedback(scale: Float, active: Boolean) {
+        if (!::binding.isInitialized)
+            return
+
+        val gestureTextView = binding.gestureTextView
+        if (gestureTextView.visibility != View.VISIBLE)
+            refreshPlayerOverlay()
+
+        fadeHandler.removeCallbacks(fadeRunnable3)
+        gestureTextView.visibility = View.VISIBLE
+        gestureTextView.text = getString(R.string.ui_zoom, scale)
+        if (!active)
+            fadeHandler.postDelayed(fadeRunnable3, ZOOM_FEEDBACK_FADE_DELAY_MS)
+    }
+
     override fun onPropertyChange(p: PropertyChange, diff: Float) {
         val gestureTextView = binding.gestureTextView
         when (p) {
@@ -4744,6 +4761,7 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         // Controls fade-in/out durations (ms). Keep them very fast but non-zero to avoid a harsh pop.
         private const val CONTROLS_FADE_IN_DURATION = 80L
         private const val CONTROLS_FADE_OUT_DURATION = 80L
+        private const val ZOOM_FEEDBACK_FADE_DELAY_MS = 450L
         // Predictive aspect-menu geometry is held briefly so asynchronous mpv
         // property notifications cannot momentarily restore an intermediate state.
         private const val ASPECT_MENU_PREDICTIVE_SYNC_GRACE_MS = 120L

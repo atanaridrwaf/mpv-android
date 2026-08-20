@@ -1,5 +1,6 @@
 package `is`.xyz.mpv
 
+import android.app.ActivityManager
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -40,6 +41,7 @@ import kotlin.math.sqrt
  */
 internal class VideoZoomGestures(
     private val target: View,
+    private val onZoomFeedback: ((scale: Float, active: Boolean) -> Unit)? = null,
 ) {
     private val renderTarget = target as? BaseMPVView
 
@@ -55,6 +57,11 @@ internal class VideoZoomGestures(
     private val viewConfiguration = ViewConfiguration.get(target.context)
     private val touchSlop = viewConfiguration.scaledTouchSlop.toFloat()
     private val panStartSlop = max(1f, min(2.5f, touchSlop * 0.22f))
+    // Moving the midpoint of two fingers is interpreted as pan only after a
+    // small dead-zone. This keeps ordinary pinch sensor jitter from making the
+    // picture "swim", while still allowing natural pinch+pan once intentional
+    // centroid motion is clear.
+    private val pinchPanStartSlop = max(3f, min(8f, touchSlop * 0.60f))
     private val minimumFlingVelocity = viewConfiguration.scaledMinimumFlingVelocity.toFloat()
     private val maximumFlingVelocity = viewConfiguration.scaledMaximumFlingVelocity.toFloat()
 
@@ -101,16 +108,29 @@ internal class VideoZoomGestures(
     private var panMovedDuringTouch = false
     private var canBeTap = false
 
+    // Fresh single-finger touches while a *playing* video is zoomed remain
+    // available to the normal player gestures (seek/volume/brightness). A
+    // finger that remains after pinch, or a fresh touch while paused/still, is
+    // owned by zoom pan. This keeps direct pinch->one-finger continuation while
+    // avoiding the classic "zoom mode killed every player gesture" problem.
+    private var singleFingerOwner = SingleFingerOwner.NONE
+
     private var tapStartTx = 0.0
     private var tapStartTy = 0.0
 
-    // The zoom anchor is captured when the second finger touches the screen and
-    // remains fixed until every finger has been lifted. ScaleGestureDetector's
-    // focus normally follows the moving midpoint, which unintentionally changes
-    // the part of the image being zoomed during the same gesture.
+    // Two-finger zoom keeps a stable anchor while the centroid is inside a small
+    // dead-zone. Once the centroid clearly moves, we switch to the exact affine
+    // update that combines pinch + pan in one transform:
+    //   t' = k*t + focusNow - k*focusPrev
+    // This preserves the content point under the fingers and avoids the jumpy
+    // midpoint behavior of a naive ScaleGestureDetector implementation.
     private var pinchTouchSessionActive = false
-    private var lockedPinchFocusX = 0f
-    private var lockedPinchFocusY = 0f
+    private var pinchAnchorX = 0f
+    private var pinchAnchorY = 0f
+    private var previousPinchFocusX = 0f
+    private var previousPinchFocusY = 0f
+    private var pinchPanActive = false
+    private var lastPinchPanMotionUptimeMs = 0L
 
     private var lastTapTime = 0L
     private var lastTapX = 0f
@@ -120,6 +140,8 @@ internal class VideoZoomGestures(
     private val panFilterY = OneEuroFilter()
 
     private var requestedRenderSurfaceMode = RenderSurfaceMode.BASE
+    private var requestedRenderSurfaceWidth = 0
+    private var requestedRenderSurfaceHeight = 0
     private var displayedRenderSurfaceMode = RenderSurfaceMode.BASE
     private var surfaceModeTransitionInFlight: RenderSurfaceMode? = null
     private var queuedRenderSurfaceUpdate = false
@@ -128,10 +150,12 @@ internal class VideoZoomGestures(
     private var lastSurfaceFrameUptimeMs = Long.MIN_VALUE
     private var zoomRenderSurfaceMode: RenderSurfaceMode? = null
     private var zoomHighQualityRequested = false
+    private var progressiveRenderBufferScale = 1.0
 
     private var lastZoomMotionUptimeMs = 0L
     private var smoothedZoomVelocity = Float.POSITIVE_INFINITY
     private var slowZoomMotionSinceMs = 0L
+    private var predictiveSlowZoomSinceMs = 0L
     private var zoomQualityMonitorPosted = false
     private val zoomQualityMonitor = object : Runnable {
         override fun run() {
@@ -140,23 +164,38 @@ internal class VideoZoomGestures(
                 return
 
             val now = SystemClock.uptimeMillis()
-            val motionAge = now - lastZoomMotionUptimeMs
+            val latestMotion = max(lastZoomMotionUptimeMs, lastPinchPanMotionUptimeMs)
+            val motionAge = now - latestMotion
             val quietEnough = motionAge >= ZOOM_QUIET_GAP_MS
+            val panQuietEnough = now - lastPinchPanMotionUptimeMs >= ZOOM_QUIET_GAP_MS
             val slowEnough = smoothedZoomVelocity <= ZOOM_SLOW_VELOCITY_PER_SECOND
+            val predictivelySlow = scale >= ZOOM_PREDICTIVE_MIN_SCALE &&
+                smoothedZoomVelocity <= ZOOM_PREDICTIVE_VELOCITY_PER_SECOND
 
             if (quietEnough && motionAge >= ZOOM_QUIET_UPGRADE_DELAY_MS) {
                 requestZoomHighQuality()
                 return
             }
 
-            if (slowEnough) {
+            if (predictivelySlow && panQuietEnough) {
+                if (predictiveSlowZoomSinceMs == 0L)
+                    predictiveSlowZoomSinceMs = now
+                if (now - predictiveSlowZoomSinceMs >= ZOOM_PREDICTIVE_DWELL_MS) {
+                    requestZoomHighQuality()
+                    return
+                }
+            } else if (!panQuietEnough) {
+                predictiveSlowZoomSinceMs = 0L
+            }
+
+            if (slowEnough && panQuietEnough) {
                 if (slowZoomMotionSinceMs == 0L)
                     slowZoomMotionSinceMs = now
                 if (now - slowZoomMotionSinceMs >= ZOOM_SLOW_DWELL_MS) {
                     requestZoomHighQuality()
                     return
                 }
-            } else if (!quietEnough) {
+            } else if (!panQuietEnough) {
                 slowZoomMotionSinceMs = 0L
             }
 
@@ -199,9 +238,12 @@ internal class VideoZoomGestures(
                 // without delivering that pointer transition to this view.
                 if (!pinchTouchSessionActive) {
                     pinchTouchSessionActive = true
-                    lockedPinchFocusX = detector.focusX
-                    lockedPinchFocusY = detector.focusY
+                    pinchAnchorX = detector.focusX
+                    pinchAnchorY = detector.focusY
                 }
+                previousPinchFocusX = detector.focusX
+                previousPinchFocusY = detector.focusY
+                pinchPanActive = false
 
                 // Keep the view-sized BASE buffer while the pinch is moving; the quality monitor
                 // upgrades to original detail once the zoom motion slows or settles.
@@ -211,13 +253,16 @@ internal class VideoZoomGestures(
                     zoomRenderSurfaceMode = null
                 }
                 lastZoomMotionUptimeMs = now
+                lastPinchPanMotionUptimeMs = now
                 smoothedZoomVelocity = Float.POSITIVE_INFINITY
                 slowZoomMotionSinceMs = 0L
+                predictiveSlowZoomSinceMs = 0L
                 updateRenderSurfaceForCurrentState(force = false)
                 applyToView()
                 postZoomQualityMonitor()
 
                 resetPanFilters(detector.focusX, detector.focusY, now)
+                onZoomFeedback?.invoke(scale, true)
                 return true
             }
 
@@ -229,36 +274,76 @@ internal class VideoZoomGestures(
                 val oldScale = scale
                 val requested = oldScale * detector.scaleFactor
                 val newScale = requested.coerceIn(MIN_SCALE, MAX_SCALE)
+                val now = SystemClock.uptimeMillis()
+
+                val focusX = detector.focusX
+                val focusY = detector.focusY
+                val focusTravel = hypot(focusX - pinchAnchorX, focusY - pinchAnchorY)
+                if (!pinchPanActive && focusTravel >= pinchPanStartSlop) {
+                    // Rebase at the activation point so crossing the dead-zone does
+                    // not suddenly replay all accumulated centroid travel.
+                    pinchPanActive = true
+                    previousPinchFocusX = focusX
+                    previousPinchFocusY = focusY
+                }
 
                 if (newScale <= PINCH_DOUBLE_TAP_RESET_SCALE) {
                     scale = 1f
                     tx = 0.0
                     ty = 0.0
                     pendingPinchDoubleTapReset = true
-                    resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
+                    previousPinchFocusX = focusX
+                    previousPinchFocusY = focusY
+                    resetPanFilters(focusX, focusY, now)
+                    onZoomFeedback?.invoke(scale, true)
                     scheduleApply()
                     return true
                 }
 
                 pendingPinchDoubleTapReset = false
-                if (newScale == oldScale)
+                val scaleChanged = abs(newScale - oldScale) > EPS
+                val centroidDx = focusX - previousPinchFocusX
+                val centroidDy = focusY - previousPinchFocusY
+                val centroidMoved = pinchPanActive && (abs(centroidDx) > EPS || abs(centroidDy) > EPS)
+
+                if (!scaleChanged && !centroidMoved) {
+                    previousPinchFocusX = focusX
+                    previousPinchFocusY = focusY
                     return true
+                }
 
-                // Keep the zoom focus fixed at the midpoint captured when the
-                // two-finger touch session started. Moving both fingers does not
-                // pan the image; multi-touch is reserved exclusively for zoom.
                 // transform: screen = scale * content + translation
-                val fx = lockedPinchFocusX.toDouble()
-                val fy = lockedPinchFocusY.toDouble()
                 val k = (newScale / oldScale).toDouble()
-                tx = (k * tx) + ((1.0 - k) * fx)
-                ty = (k * ty) + ((1.0 - k) * fy)
+                if (pinchPanActive) {
+                    // Exact combined pinch + moving-centroid pan. A point under
+                    // previousFocus remains under currentFocus after scaling.
+                    tx = (k * tx) + focusX.toDouble() - (k * previousPinchFocusX.toDouble())
+                    ty = (k * ty) + focusY.toDouble() - (k * previousPinchFocusY.toDouble())
+                    if (centroidMoved)
+                        lastPinchPanMotionUptimeMs = now
+                } else {
+                    // Before intentional centroid motion is established, preserve
+                    // the original stable-anchor behavior to suppress pinch jitter.
+                    val fx = pinchAnchorX.toDouble()
+                    val fy = pinchAnchorY.toDouble()
+                    tx = (k * tx) + ((1.0 - k) * fx)
+                    ty = (k * ty) + ((1.0 - k) * fy)
+                }
                 scale = newScale
+                previousPinchFocusX = focusX
+                previousPinchFocusY = focusY
 
-                val now = SystemClock.uptimeMillis()
-                updateZoomMotionVelocity(oldScale, newScale, now)
+                if (scaleChanged) {
+                    updateZoomMotionVelocity(oldScale, newScale, now)
+                    if (zoomHighQualityRequested &&
+                        smoothedZoomVelocity <= ZOOM_PROGRESSIVE_RESIZE_MAX_VELOCITY_PER_SECOND
+                    ) {
+                        updateRenderSurfaceForCurrentState(force = false)
+                    }
+                    onZoomFeedback?.invoke(scale, true)
+                }
                 clampTranslationToVideoContent()
-                resetPanFilters(detector.focusX, detector.focusY, now)
+                resetPanFilters(focusX, focusY, now)
                 scheduleApply()
                 return true
             }
@@ -271,6 +356,7 @@ internal class VideoZoomGestures(
                     stopZoomQualityMonitor()
                     resetPanFilters(detector.focusX, detector.focusY, SystemClock.uptimeMillis())
                     requestZoomHighQuality()
+                    onZoomFeedback?.invoke(scale, false)
                 }
             }
         }
@@ -397,7 +483,22 @@ internal class VideoZoomGestures(
     }
 
     fun shouldBlockOtherGestures(e: MotionEvent): Boolean {
-        return isZoomed() || pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1
+        if (pendingPinchDoubleTapReset || scaleDetector.isInProgress || e.pointerCount > 1)
+            return true
+        if (!isZoomed())
+            return false
+
+        // ACTION_DOWN starts a new ownership decision. Do not let the owner from
+        // the previous sequence leak into this event; both dispatchTouchEvent and
+        // the gesture-layer listener ask this before onTouchEvent receives DOWN.
+        if (e.actionMasked == MotionEvent.ACTION_DOWN)
+            return isFlingInProgress() || shouldZoomOwnFreshSingleFingerTouch()
+
+        return when (singleFingerOwner) {
+            SingleFingerOwner.ZOOM_PAN -> true
+            SingleFingerOwner.PLAYER -> false
+            SingleFingerOwner.NONE -> true
+        }
     }
 
     fun reset() {
@@ -419,6 +520,7 @@ internal class VideoZoomGestures(
         lastSurfaceFrameUptimeMs = Long.MIN_VALUE
         zoomRenderSurfaceMode = null
         zoomHighQualityRequested = false
+        progressiveRenderBufferScale = 1.0
         commitHiddenBaseRenderSurfaceMode()
         requestBaseRenderSurfaceSize(force = true)
         applyToView()
@@ -453,14 +555,18 @@ internal class VideoZoomGestures(
         panActive = false
         panMovedDuringTouch = false
         canBeTap = false
+        singleFingerOwner = SingleFingerOwner.NONE
         lastTapTime = 0L
         pendingPinchDoubleTapReset = false
         stopZoomQualityMonitor()
         zoomRenderSurfaceMode = null
         zoomHighQualityRequested = false
+        progressiveRenderBufferScale = 1.0
         lastZoomMotionUptimeMs = 0L
+        lastPinchPanMotionUptimeMs = 0L
         smoothedZoomVelocity = Float.POSITIVE_INFINITY
         slowZoomMotionSinceMs = 0L
+        predictiveSlowZoomSinceMs = 0L
         resetPanFilters(0f, 0f, SystemClock.uptimeMillis())
         target.alpha = 1f
     }
@@ -479,6 +585,7 @@ internal class VideoZoomGestures(
             // but deferred until the pinch detector has fully ended so surface
             // selection follows the smooth double-tap path.
             reset()
+            onZoomFeedback?.invoke(1f, false)
         }
     }
 
@@ -492,11 +599,24 @@ internal class VideoZoomGestures(
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                val stoppingFling = isFlingInProgress()
                 stopFling()
                 // ACTION_DOWN means the previous touch session is fully over.
                 endPinchTouchSession()
                 panMovedDuringTouch = false
-                beginPanVelocityTracking(e.x, e.y, e.eventTime)
+                singleFingerOwner = if (isZoomed()) {
+                    if (stoppingFling || shouldZoomOwnFreshSingleFingerTouch())
+                        SingleFingerOwner.ZOOM_PAN
+                    else
+                        SingleFingerOwner.PLAYER
+                } else {
+                    SingleFingerOwner.NONE
+                }
+
+                if (singleFingerOwner == SingleFingerOwner.ZOOM_PAN)
+                    beginPanVelocityTracking(e.x, e.y, e.eventTime)
+                else
+                    recyclePanVelocityTracker()
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
@@ -511,6 +631,7 @@ internal class VideoZoomGestures(
                 panFingerDown = false
                 panActive = false
                 canBeTap = false
+                singleFingerOwner = SingleFingerOwner.NONE
                 beginPinchTouchSession(e)
             }
         }
@@ -527,6 +648,7 @@ internal class VideoZoomGestures(
             panFingerDown = false
             panActive = false
             canBeTap = false
+            singleFingerOwner = SingleFingerOwner.NONE
             resetPanFilters(lastPointerX, lastPointerY, SystemClock.uptimeMillis())
             recyclePanVelocityTracker()
             return isZoomed() || pendingPinchDoubleTapReset
@@ -540,7 +662,16 @@ internal class VideoZoomGestures(
             panActive = false
             canBeTap = false
             val remainingPointerCount = e.pointerCount - 1
-            if (remainingPointerCount == 1) {
+            if (remainingPointerCount >= 2) {
+                pointerCentroidExcept(e, e.actionIndex)?.let { focus ->
+                    pinchAnchorX = focus.x
+                    pinchAnchorY = focus.y
+                    previousPinchFocusX = focus.x
+                    previousPinchFocusY = focus.y
+                    pinchPanActive = false
+                    lastPinchPanMotionUptimeMs = SystemClock.uptimeMillis()
+                }
+            } else if (remainingPointerCount == 1) {
                 val upIdx = e.actionIndex
                 val remainIdx = firstPointerIndexExcept(e, upIdx)
                 if (remainIdx < 0)
@@ -563,11 +694,11 @@ internal class VideoZoomGestures(
                 panMovedDuringTouch = false
                 rebasePanVelocityTracking(x, y, e.eventTime)
 
-                // Keep the remaining finger as an active one-finger pan.
-                // Previously this stayed false, so the following MOVE events were
-                // consumed while zoomed but ignored until every finger was lifted
-                // and a fresh ACTION_DOWN was received.
+                // Keep the remaining finger as an active one-finger pan. This
+                // direct pinch -> one-finger continuation always belongs to zoom,
+                // even while the video is playing.
                 panFingerDown = true
+                singleFingerOwner = SingleFingerOwner.ZOOM_PAN
             }
             return true
         }
@@ -586,6 +717,7 @@ internal class VideoZoomGestures(
             panActive = false
             panMovedDuringTouch = false
             canBeTap = false
+            singleFingerOwner = SingleFingerOwner.NONE
             recyclePanVelocityTracker()
             return true
         }
@@ -594,6 +726,15 @@ internal class VideoZoomGestures(
             if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
                 recyclePanVelocityTracker()
             return pendingPinchDoubleTapReset
+        }
+
+        // While normal video playback is running, a fresh one-finger sequence is
+        // delegated to TouchGestures. Zoom still owns every two-finger sequence
+        // and the one finger that remains after a pinch.
+        if (singleFingerOwner == SingleFingerOwner.PLAYER) {
+            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
+                recyclePanVelocityTracker()
+            return false
         }
 
         when (e.actionMasked) {
@@ -659,6 +800,7 @@ internal class VideoZoomGestures(
                 val dist = hypot(e.x - lastTapX, e.y - lastTapY)
                 if (lastTapTime != 0L && dt < DOUBLE_TAP_TIMEOUT && dist < touchSlop * 3f) {
                     reset()
+                    onZoomFeedback?.invoke(1f, false)
                     lastTapTime = 0L
                     recyclePanVelocityTracker()
                     return true
@@ -687,17 +829,47 @@ internal class VideoZoomGestures(
     private fun beginPinchTouchSession(e: MotionEvent) {
         val focus = pointerCentroid(e) ?: return
 
-        if (!pinchTouchSessionActive) {
+        // Every transition from one pointer to two begins a fresh pinch segment.
+        // Re-adding a second finger after one-finger pan must not inherit the old
+        // midpoint/dead-zone from the previous pinch segment.
+        if (!pinchTouchSessionActive || e.pointerCount == 2) {
             pinchTouchSessionActive = true
-            lockedPinchFocusX = focus.x
-            lockedPinchFocusY = focus.y
+            pinchAnchorX = focus.x
+            pinchAnchorY = focus.y
+            previousPinchFocusX = focus.x
+            previousPinchFocusY = focus.y
+            pinchPanActive = false
+            lastPinchPanMotionUptimeMs = SystemClock.uptimeMillis()
         }
     }
 
     private fun endPinchTouchSession() {
         pinchTouchSessionActive = false
-        lockedPinchFocusX = 0f
-        lockedPinchFocusY = 0f
+        pinchAnchorX = 0f
+        pinchAnchorY = 0f
+        previousPinchFocusX = 0f
+        previousPinchFocusY = 0f
+        pinchPanActive = false
+    }
+
+    private fun shouldZoomOwnFreshSingleFingerTouch(): Boolean {
+        if (!isZoomed())
+            return false
+
+        val paused = try {
+            MPVLib.getPropertyBoolean("pause") == true
+        } catch (_: Throwable) {
+            false
+        }
+        if (paused)
+            return true
+
+        return try {
+            MPVLib.getPropertyString("current-tracks/video/image")
+                ?.equals("yes", ignoreCase = true) == true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun pointerCentroid(e: MotionEvent): PointerCentroid? {
@@ -710,6 +882,22 @@ internal class VideoZoomGestures(
             count++
         }
 
+        if (count == 0)
+            return null
+        return PointerCentroid(sumX / count, sumY / count)
+    }
+
+    private fun pointerCentroidExcept(e: MotionEvent, excludedPointerIndex: Int): PointerCentroid? {
+        var sumX = 0f
+        var sumY = 0f
+        var count = 0
+        for (i in 0 until e.pointerCount) {
+            if (i == excludedPointerIndex)
+                continue
+            sumX += e.getX(i)
+            sumY += e.getY(i)
+            count++
+        }
         if (count == 0)
             return null
         return PointerCentroid(sumX / count, sumY / count)
@@ -1063,6 +1251,8 @@ internal class VideoZoomGestures(
             return
 
         player.resetRenderSurfaceSize()
+        requestedRenderSurfaceWidth = 0
+        requestedRenderSurfaceHeight = 0
         markRenderSurfaceModeRequested(RenderSurfaceMode.BASE)
     }
 
@@ -1070,9 +1260,6 @@ internal class VideoZoomGestures(
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
 
-        if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
-            return
-
         if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
             requestBaseRenderSurfaceSize(force = true)
             return
@@ -1084,15 +1271,24 @@ internal class VideoZoomGestures(
             return
         }
 
-        val bufferScale = limitedOriginalDetailBufferScale(
+        val bufferScale = limitedDetailBufferScale(
             baseWidth = viewWidth.toDouble(),
             baseHeight = viewHeight.toDouble(),
             content = c,
+            desired = progressiveDetailBufferScale(c),
         )
 
         val bufferWidth = ceilToIntAtLeastOne(viewWidth.toDouble() * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(viewHeight.toDouble() * bufferScale)
+        if (!force &&
+            requestedRenderSurfaceMode == RenderSurfaceMode.VIEW_ASPECT_ORIGINAL &&
+            requestedRenderSurfaceWidth == bufferWidth &&
+            requestedRenderSurfaceHeight == bufferHeight
+        ) return
+
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        requestedRenderSurfaceWidth = bufferWidth
+        requestedRenderSurfaceHeight = bufferHeight
         markRenderSurfaceModeRequested(RenderSurfaceMode.VIEW_ASPECT_ORIGINAL)
     }
 
@@ -1100,9 +1296,6 @@ internal class VideoZoomGestures(
         val player = renderTarget ?: return
         refreshMetricsFromTarget()
 
-        if (!force && requestedRenderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
-            return
-
         if (viewWidth <= 1f || viewHeight <= 1f || videoPixelWidth <= 1 || videoPixelHeight <= 1) {
             requestBaseRenderSurfaceSize(force = true)
             return
@@ -1114,15 +1307,24 @@ internal class VideoZoomGestures(
             return
         }
 
-        val bufferScale = limitedOriginalDetailBufferScale(
+        val bufferScale = limitedDetailBufferScale(
             baseWidth = c.w.toDouble(),
             baseHeight = c.h.toDouble(),
             content = c,
+            desired = progressiveDetailBufferScale(c),
         )
 
         val bufferWidth = ceilToIntAtLeastOne(c.w.toDouble() * bufferScale)
         val bufferHeight = ceilToIntAtLeastOne(c.h.toDouble() * bufferScale)
+        if (!force &&
+            requestedRenderSurfaceMode == RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL &&
+            requestedRenderSurfaceWidth == bufferWidth &&
+            requestedRenderSurfaceHeight == bufferHeight
+        ) return
+
         player.setRenderSurfaceSize(bufferWidth, bufferHeight)
+        requestedRenderSurfaceWidth = bufferWidth
+        requestedRenderSurfaceHeight = bufferHeight
         markRenderSurfaceModeRequested(RenderSurfaceMode.MEDIA_ASPECT_ORIGINAL)
     }
 
@@ -1138,6 +1340,8 @@ internal class VideoZoomGestures(
 
     private fun commitHiddenBaseRenderSurfaceMode() {
         requestedRenderSurfaceMode = RenderSurfaceMode.BASE
+        requestedRenderSurfaceWidth = 0
+        requestedRenderSurfaceHeight = 0
         displayedRenderSurfaceMode = RenderSurfaceMode.BASE
         surfaceModeTransitionInFlight = null
         queuedRenderSurfaceUpdate = false
@@ -1149,6 +1353,7 @@ internal class VideoZoomGestures(
         if (previousTime <= 0L || now <= previousTime) {
             smoothedZoomVelocity = Float.POSITIVE_INFINITY
             slowZoomMotionSinceMs = 0L
+            predictiveSlowZoomSinceMs = 0L
             postZoomQualityMonitor()
             return
         }
@@ -1166,16 +1371,23 @@ internal class VideoZoomGestures(
 
         if (smoothedZoomVelocity > ZOOM_SLOW_VELOCITY_PER_SECOND)
             slowZoomMotionSinceMs = 0L
+        if (smoothedZoomVelocity > ZOOM_PREDICTIVE_VELOCITY_PER_SECOND)
+            predictiveSlowZoomSinceMs = 0L
         postZoomQualityMonitor()
     }
 
     private fun requestZoomHighQuality() {
-        if (zoomHighQualityRequested || !isZoomed())
+        if (!isZoomed())
             return
 
-        zoomHighQualityRequested = true
-        zoomRenderSurfaceMode = null
-        stopZoomQualityMonitor()
+        if (!zoomHighQualityRequested) {
+            zoomHighQualityRequested = true
+            zoomRenderSurfaceMode = null
+            stopZoomQualityMonitor()
+        }
+        // Re-evaluate the progressive detail bucket even when HQ was already
+        // active; onScaleEnd uses this to catch up after a deliberately deferred
+        // resize during a fast gesture.
         updateRenderSurfaceForCurrentState(force = false)
     }
 
@@ -1236,25 +1448,72 @@ internal class VideoZoomGestures(
 
     private fun isPanscanActive(): Boolean = panscan > EPS.toDouble()
 
-    private fun limitedOriginalDetailBufferScale(
+    private fun progressiveDetailBufferScale(content: ContentRect): Double {
+        val original = originalDetailBufferScale(content)
+        if (original <= 1.0)
+            return 1.0
+
+        // Render only as much source detail as the current crop can visibly use.
+        // This avoids jumping straight from a display-sized buffer to an 8K-sized
+        // buffer at 1.1x, yet naturally reaches full source detail as zoom grows.
+        val desired = (scale.toDouble() * DETAIL_BUFFER_OVERSCAN)
+            .coerceIn(1.0, original)
+
+        // Quantization plus downshift hysteresis prevents SurfaceTexture
+        // reallocations for every tiny scale wobble around a bucket boundary.
+        // Upshifts happen promptly for sharpness; downshifts require the desired
+        // scale to fall meaningfully below the current bucket.
+        val candidate = min(DETAIL_BUFFER_BUCKETS.firstOrNull { it >= desired } ?: original, original)
+        val current = progressiveRenderBufferScale.coerceIn(1.0, original)
+        val selected = when {
+            candidate > current + DETAIL_BUCKET_EPSILON -> candidate
+            candidate < current - DETAIL_BUCKET_EPSILON &&
+                desired <= current * DETAIL_BUCKET_DOWNSHIFT_RATIO -> candidate
+            else -> current
+        }
+        progressiveRenderBufferScale = selected.coerceIn(1.0, original)
+        return progressiveRenderBufferScale
+    }
+
+    private fun limitedDetailBufferScale(
         baseWidth: Double,
         baseHeight: Double,
         content: ContentRect,
+        desired: Double,
     ): Double {
-        val desired = originalDetailBufferScale(content)
+        val original = originalDetailBufferScale(content)
         val maxEdge = max(baseWidth, baseHeight).coerceAtLeast(1.0)
-        val maxByEdge = MAX_RENDER_SURFACE_EDGE / maxEdge
+        val maxByEdge = maxRenderSurfaceEdge / maxEdge
         val maxByPixels = sqrt(
-            MAX_RENDER_SURFACE_PIXELS / (baseWidth * baseHeight).coerceAtLeast(1.0),
+            maxRenderSurfacePixels / (baseWidth * baseHeight).coerceAtLeast(1.0),
         )
 
-        // Avoid requesting oversized SurfaceTexture buffers. Very wide overridden
-        // ratios such as 2.35:1 on huge images can otherwise exceed the device
-        // texture limit and leave the TextureView black even after resetting zoom.
-        return desired
+        // Avoid requesting oversized SurfaceTexture buffers. The hard 8192 edge
+        // remains as a compatibility ceiling, while low-RAM devices get a smaller
+        // pixel budget so zoom quality cannot starve the rest of the player.
+        return min(desired, original)
             .coerceAtMost(maxByEdge)
             .coerceAtMost(maxByPixels)
             .coerceAtLeast(1.0)
+    }
+
+    private val maxRenderSurfaceEdge: Double by lazy {
+        val activityManager = target.context.getSystemService(ActivityManager::class.java)
+        if (activityManager?.isLowRamDevice == true) LOW_RAM_MAX_RENDER_SURFACE_EDGE else HARD_MAX_RENDER_SURFACE_EDGE
+    }
+
+    private val maxRenderSurfacePixels: Double by lazy {
+        val activityManager = target.context.getSystemService(ActivityManager::class.java)
+        if (activityManager?.isLowRamDevice != true) {
+            HARD_MAX_RENDER_SURFACE_PIXELS
+        } else {
+            val memoryClassMb = max(activityManager.largeMemoryClass, activityManager.memoryClass)
+            val memoryBudgetPixels = memoryClassMb.toDouble() * 1024.0 * 1024.0 *
+                RENDER_SURFACE_MEMORY_FRACTION / BYTES_PER_RGBA_PIXEL
+            memoryBudgetPixels
+                .coerceAtLeast(MIN_RENDER_SURFACE_PIXELS)
+                .coerceAtMost(HARD_MAX_RENDER_SURFACE_PIXELS)
+        }
     }
 
     private fun originalDetailBufferScale(c: ContentRect): Double {
@@ -1308,6 +1567,12 @@ internal class VideoZoomGestures(
         companion object {
             val IDENTITY = SurfaceFitTransform(1f, 1f, 0.0, 0.0)
         }
+    }
+
+    private enum class SingleFingerOwner {
+        NONE,
+        ZOOM_PAN,
+        PLAYER,
     }
 
     private enum class RenderSurfaceMode(val usesMediaAspectFit: Boolean) {
@@ -1406,14 +1671,26 @@ internal class VideoZoomGestures(
         private const val ZOOM_QUALITY_MONITOR_INTERVAL_MS = 32L
         private const val ZOOM_QUIET_GAP_MS = 48L
         private const val ZOOM_QUIET_UPGRADE_DELAY_MS = 135L
-        private const val ZOOM_SLOW_DWELL_MS = 145L
+        private const val ZOOM_SLOW_DWELL_MS = 120L
         private const val ZOOM_SLOW_VELOCITY_PER_SECOND = 0.32f
+        private const val ZOOM_PREDICTIVE_MIN_SCALE = 1.20f
+        private const val ZOOM_PREDICTIVE_VELOCITY_PER_SECOND = 0.60f
+        private const val ZOOM_PREDICTIVE_DWELL_MS = 80L
+        private const val ZOOM_PROGRESSIVE_RESIZE_MAX_VELOCITY_PER_SECOND = 0.80f
         private const val ZOOM_VELOCITY_SMOOTHING = 0.58f
         private const val MIN_ZOOM_VELOCITY_DT_SECONDS = 1f / 240f
         private const val MAX_ZOOM_VELOCITY_DT_SECONDS = 1f / 8f
 
-        private const val MAX_RENDER_SURFACE_EDGE = 8192.0
-        private const val MAX_RENDER_SURFACE_PIXELS = MAX_RENDER_SURFACE_EDGE * MAX_RENDER_SURFACE_EDGE
+        private const val HARD_MAX_RENDER_SURFACE_EDGE = 8192.0
+        private const val LOW_RAM_MAX_RENDER_SURFACE_EDGE = 4096.0
+        private const val HARD_MAX_RENDER_SURFACE_PIXELS = HARD_MAX_RENDER_SURFACE_EDGE * HARD_MAX_RENDER_SURFACE_EDGE
+        private const val MIN_RENDER_SURFACE_PIXELS = 3840.0 * 2160.0
+        private const val RENDER_SURFACE_MEMORY_FRACTION = 0.08
+        private const val BYTES_PER_RGBA_PIXEL = 4.0
+        private const val DETAIL_BUFFER_OVERSCAN = 1.12
+        private const val DETAIL_BUCKET_DOWNSHIFT_RATIO = 0.84
+        private const val DETAIL_BUCKET_EPSILON = 0.0001
+        private val DETAIL_BUFFER_BUCKETS = doubleArrayOf(1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
 
         private const val DEFAULT_FRAME_DT = 1f / 60f
         private const val MIN_FILTER_DT = 1f / 240f
