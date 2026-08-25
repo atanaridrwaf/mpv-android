@@ -131,9 +131,6 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // We achieve this by sending seek updates more frequently than volume/brightness.
         private const val SEEK_THROTTLE_DIV = 24
 
-        // Start seeking after only a few pixels while still leaving a tiny margin for touch noise.
-        private const val SEEK_ACTIVATION_DIV = 12
-
         // Require gestures to be clearly horizontal/vertical before locking to that axis.
         // This prevents accidental seeks when the user swipes mostly vertically.
         private const val DIRECTION_LOCK_RATIO = 1.25f
@@ -157,10 +154,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
     }
 
     private fun activationThreshold(gesture: State): Float {
-        return if (gesture == State.ControlSeek)
-            max(1f, trigger / SEEK_ACTIVATION_DIV)
-        else
-            trigger
+        return if (gesture == State.ControlSeek) trigger / 4 else trigger
     }
 
     private fun isInNavigationGestureCaptureRegion(p: PointF): Boolean {
@@ -361,12 +355,7 @@ internal class TouchGestures(private val observer: TouchGesturesObserver) {
         // throttle events: only send updates when there's some movement compared to last update
         // 3 here is arbitrary.
         // For seeking we want finer updates so the step size becomes ~1s on slow drag.
-        // While direction is still undecided, use the seek-sized throttle too. Otherwise the
-        // larger generic throttle masks seek's intentionally tiny activation threshold.
-        val throttle = if (state == State.Down || state == State.ControlSeek)
-            trigger / SEEK_THROTTLE_DIV
-        else
-            trigger / 3
+        val throttle = if (state == State.ControlSeek) trigger / SEEK_THROTTLE_DIV else trigger / 3
         if (PointF(lastPos.x - p.x, lastPos.y - p.y).length() < throttle)
             return false
         lastPos.set(p)
