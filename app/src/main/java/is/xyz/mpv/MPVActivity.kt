@@ -4554,18 +4554,20 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
     // Any drag distance beyond 0/duration is folded into this offset, so the
     // next 1-second movement in the opposite direction immediately leaves the edge.
     private var gestureSeekDeltaOffsetSec = 0
+    private var gestureSeekStartOffsetSec = 0f
+    private var gestureSeekStartOffsetPending = false
 
     private fun quantizeGestureSeekDelta(diff: Float): Int {
         val magnitude = abs(diff)
 
-        // Preserve the original +/-00:00 range, then make every non-zero
-        // second step 2.5 times as wide as in the original behavior.
-        if (magnitude < GESTURE_SEEK_ZERO_HALF_STEP)
+        // Give 0 exactly the same drag width as every other whole-second value. The zero
+        // interval is centered around the origin; non-zero intervals keep the existing width.
+        if (magnitude < GESTURE_SEEK_STEP_WIDTH / 2f)
             return 0
 
         val seconds = 1 +
-                ((magnitude - GESTURE_SEEK_ZERO_HALF_STEP) /
-                        GESTURE_SEEK_NONZERO_STEP_WIDTH).toInt()
+                ((magnitude - GESTURE_SEEK_STEP_WIDTH / 2f) /
+                        GESTURE_SEEK_STEP_WIDTH).toInt()
         return if (diff < 0f) -seconds else seconds
     }
 
@@ -4598,6 +4600,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 if (!isPlayingAudio)
                     maxVolume = 0 // disallow volume gesture if no audio
                 gestureSeekDeltaOffsetSec = 0
+                gestureSeekStartOffsetSec = 0f
+                gestureSeekStartOffsetPending = true
 
                 fadeHandler.removeCallbacks(fadeRunnable3)
                 gestureTextView.visibility = View.VISIBLE
@@ -4631,9 +4635,23 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
                 // video. Once a step would carry the target at or past either edge, the target
                 // snaps exactly to that edge (0.000 or the full duration) instead of leaving a
                 // sub-second remainder sitting just inside it.
+                // Translate the seek scale once, when its first real update arrives, so that
+                // update lands exactly in the center of +/-1. Keep the translation fixed for the
+                // rest of the gesture: dragging back still reaches the full-width 0 interval and
+                // can continue through to values on the opposite side.
+                if (gestureSeekStartOffsetPending) {
+                    if (diff == 0f)
+                        return
+                    gestureSeekStartOffsetSec = if (diff < 0f)
+                        -GESTURE_SEEK_STEP_WIDTH - diff
+                    else
+                        GESTURE_SEEK_STEP_WIDTH - diff
+                    gestureSeekStartOffsetPending = false
+                }
+
                 val basePos = initialSeek.toDouble()
                 val fullDuration = duration.toDouble()
-                val rawDeltaSec = quantizeGestureSeekDelta(diff)
+                val rawDeltaSec = quantizeGestureSeekDelta(diff + gestureSeekStartOffsetSec)
                 val minDeltaSec = floor(-basePos).toInt()
                 val maxDeltaSec = ceil(fullDuration - basePos).toInt()
                 var deltaSec = rawDeltaSec - gestureSeekDeltaOffsetSec
@@ -4701,6 +4719,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
 
                 pendingGestureSeekSec = null
                 gestureSeekDeltaOffsetSec = 0
+                gestureSeekStartOffsetSec = 0f
+                gestureSeekStartOffsetPending = false
                 gestureTextView.visibility = View.GONE
             }
 
@@ -4778,10 +4798,8 @@ private fun openAdvancedMenu(restoreState: StateRestoreCallback) {
         private const val RESULT_INTENT = "is.xyz.mpv.MPVActivity.result"
         // stream type used with AudioManager
         private const val STREAM_TYPE = AudioManager.STREAM_MUSIC
-        // Use 100% of the original zero-step width and 250% of the original
-        // non-zero whole-second step width.
-        private const val GESTURE_SEEK_ZERO_HALF_STEP = 0.5f
-        private const val GESTURE_SEEK_NONZERO_STEP_WIDTH = 2.5f
+        // Every displayed whole-second seek value, including 0, occupies the same drag width.
+        private const val GESTURE_SEEK_STEP_WIDTH = 2.5f
 
         // Start preview only after the numeric seek target itself has remained unchanged for this
         // interval. Touch events that still map to the same target do not postpone the seek.
