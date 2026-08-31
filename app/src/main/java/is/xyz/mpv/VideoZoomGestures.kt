@@ -188,20 +188,17 @@ internal class VideoZoomGestures(
         target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                // ScaleGestureDetector can also start one-finger quick/stylus scaling. Zoom in
+                // this player is strictly a two-finger gesture, so accept a scale only after an
+                // actual ACTION_POINTER_DOWN opened a pinch touch session.
+                if (!pinchTouchSessionActive)
+                    return false
+
                 stopFling()
                 lastTapTime = 0L
                 pendingPinchDoubleTapReset = false
                 panActive = false
                 canBeTap = false
-
-                // Normally this was already captured on ACTION_POINTER_DOWN. Keep
-                // this fallback for unusual event streams that start the detector
-                // without delivering that pointer transition to this view.
-                if (!pinchTouchSessionActive) {
-                    pinchTouchSessionActive = true
-                    lockedPinchFocusX = detector.focusX
-                    lockedPinchFocusY = detector.focusY
-                }
 
                 // Keep the view-sized BASE buffer while the pinch is moving; the quality monitor
                 // upgrades to original detail once the zoom motion slows or settles.
@@ -274,7 +271,13 @@ internal class VideoZoomGestures(
                 }
             }
         }
-    )
+    ).apply {
+        // Android enables double-tap-and-drag "quick scale" by default. That turns the second
+        // tap of a normal one-finger double-tap into zoom and can steal the rest of the stream
+        // from seek/pan handling. Stylus-button scaling is also single-pointer, so disable both.
+        setQuickScaleEnabled(false)
+        setStylusScaleEnabled(false)
+    }
 
     fun setMetrics(width: Float, height: Float) {
         stopFling()

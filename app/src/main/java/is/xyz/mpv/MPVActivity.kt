@@ -395,11 +395,18 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN)
                 gestures.cancel()
 
-            val blockDefault = zoomGestures.shouldBlockOtherGestures(e)
+            val blockDefaultBeforeZoom = zoomGestures.shouldBlockOtherGestures(e)
             val handledByZoom = zoomGestures.onTouchEvent(e)
+            val blockDefaultAfterZoom = zoomGestures.shouldBlockOtherGestures(e)
+
+            // If zoom takes ownership in the middle of a stream, close any active default
+            // gesture immediately. Otherwise TouchGestures never receives ACTION_UP and a scrub
+            // seek can leave its overlay visible and playback held until the next seek.
+            if (!blockDefaultBeforeZoom && blockDefaultAfterZoom)
+                gestures.cancel()
 
             when {
-                blockDefault -> handledByZoom
+                blockDefaultBeforeZoom || blockDefaultAfterZoom -> handledByZoom
                 else -> gestures.onTouchEvent(e)
             }
         }
