@@ -274,9 +274,7 @@ internal class VideoZoomGestures(
                 }
             }
         }
-    ).apply {
-        isQuickScaleEnabled = false
-    }
+    )
 
     fun setMetrics(width: Float, height: Float) {
         stopFling()
