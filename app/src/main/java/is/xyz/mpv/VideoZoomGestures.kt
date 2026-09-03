@@ -275,11 +275,7 @@ internal class VideoZoomGestures(
             }
         }
     ).apply {
-        // ScaleGestureDetector enables quick-scale by default: a double-tap followed by
-        // dragging the second tap can zoom with one finger. That conflicts with the
-        // player's double-tap/tap gestures, so zoom must be strictly two-pointer only.
         isQuickScaleEnabled = false
-        isStylusScaleEnabled = false
     }
 
     fun setMetrics(width: Float, height: Float) {
