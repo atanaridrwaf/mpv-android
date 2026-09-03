@@ -188,18 +188,20 @@ internal class VideoZoomGestures(
         target.context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                // Zoom is strictly a two-finger gesture. ScaleGestureDetector can also enter
-                // one-finger quick-scale after a double tap (and stylus-button scale on newer
-                // Android versions). Those streams have no ACTION_POINTER_DOWN, so refusing
-                // them here is a second guard in addition to disabling those detector modes.
-                if (!pinchTouchSessionActive)
-                    return false
-
                 stopFling()
                 lastTapTime = 0L
                 pendingPinchDoubleTapReset = false
                 panActive = false
                 canBeTap = false
+
+                // Normally this was already captured on ACTION_POINTER_DOWN. Keep
+                // this fallback for unusual event streams that start the detector
+                // without delivering that pointer transition to this view.
+                if (!pinchTouchSessionActive) {
+                    pinchTouchSessionActive = true
+                    lockedPinchFocusX = detector.focusX
+                    lockedPinchFocusY = detector.focusY
+                }
 
                 // Keep the view-sized BASE buffer while the pinch is moving; the quality monitor
                 // upgrades to original detail once the zoom motion slows or settles.
@@ -272,11 +274,12 @@ internal class VideoZoomGestures(
                 }
             }
         }
-    ).also { detector ->
-        // Never let a double-tap + one-finger drag become zoom. mpv-android reserves zoom for
-        // a real pinch, which also prevents quick-scale from stealing the tail of a seek gesture.
-        detector.isQuickScaleEnabled = false
-        detector.isStylusScaleEnabled = false
+    ).apply {
+        // ScaleGestureDetector enables quick-scale by default: a double-tap followed by
+        // dragging the second tap can zoom with one finger. That conflicts with the
+        // player's double-tap/tap gestures, so zoom must be strictly two-pointer only.
+        isQuickScaleEnabled = false
+        isStylusScaleEnabled = false
     }
 
     fun setMetrics(width: Float, height: Float) {
