@@ -44,7 +44,8 @@ internal class SpeedPickerDialog : PickerDialog {
         binding.resetBtn.setOnClickListener {
             number = 1.0
         }
-        binding.stepButtons.visibility = View.VISIBLE
+        binding.btnMinus.visibility = View.VISIBLE
+        binding.btnPlus.visibility = View.VISIBLE
         val onClick = { delta: Double ->
             number = (number!! + delta).coerceIn(MINIMUM, MAXIMUM)
         }
