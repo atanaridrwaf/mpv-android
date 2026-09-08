@@ -1,66 +1,63 @@
 package `is`.xyz.mpv
 
-import `is`.xyz.mpv.databinding.DialogDecimalBinding
-import android.text.Editable
-import android.text.TextWatcher
+import `is`.xyz.mpv.databinding.DialogSliderBinding
 import android.view.LayoutInflater
 import android.view.View
-import java.math.BigDecimal
+import android.widget.SeekBar
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 internal class SpeedPickerDialog : PickerDialog {
     companion object {
-        // Preserve the original speed picker's range and reset value.
         private const val MINIMUM = 0.2
         private const val MAXIMUM = 6.0
-        private const val DEFAULT_SPEED = 1.0
-        private val STEP = BigDecimal("0.10")
+        private const val STEP = 0.01
+        // Progress units per 1.0x, so each unit changes speed by 0.01x.
+        private const val SCALE_FACTOR = 100.0
     }
 
-    private lateinit var binding: DialogDecimalBinding
+    private lateinit var binding: DialogSliderBinding
+
+    private fun toSpeed(it: Int): Double {
+        return max(MINIMUM, it / SCALE_FACTOR)
+    }
+
+    private fun fromSpeed(it: Double): Int {
+        return (it.coerceIn(MINIMUM, MAXIMUM) * SCALE_FACTOR).roundToInt()
+    }
 
     override fun buildView(layoutInflater: LayoutInflater): View {
-        binding = DialogDecimalBinding.inflate(layoutInflater)
+        binding = DialogSliderBinding.inflate(layoutInflater)
+        val context = layoutInflater.context
 
-        // Use the same single-row controls as the audio delay picker.
-        arrayOf(binding.label1, binding.label2, binding.rowSecondary).forEach {
-            it.visibility = View.GONE
-        }
-
-        binding.editText.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {}
-            override fun onTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {}
-
-            override fun afterTextChanged(s: Editable?) {
-                val value = s?.toString()?.toDoubleOrNull()?.takeIf { it.isFinite() } ?: return
-                val valueBounded = value.coerceIn(MINIMUM, MAXIMUM)
-                if (valueBounded != value)
-                    number = valueBounded
+        binding.seekBar.max = fromSpeed(MAXIMUM)
+        binding.seekBar.keyProgressIncrement = 1
+        binding.seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(p0: SeekBar?, p1: Int, p2: Boolean) {
+                val progress = toSpeed(p1)
+                binding.textView.text = context.getString(R.string.ui_speed, progress)
             }
+
+            override fun onStartTrackingTouch(p0: SeekBar?) {}
+            override fun onStopTrackingTouch(p0: SeekBar?) {}
         })
-        binding.btnMinus.setOnClickListener { adjustSpeed(-STEP) }
-        binding.btnPlus.setOnClickListener { adjustSpeed(STEP) }
-        binding.resetBtn.visibility = View.VISIBLE
         binding.resetBtn.setOnClickListener {
-            number = DEFAULT_SPEED
+            number = 1.0
         }
+        binding.stepButtons.visibility = View.VISIBLE
+        val onClick = { delta: Double ->
+            number = (number!! + delta).coerceIn(MINIMUM, MAXIMUM)
+        }
+        binding.btnMinus.setOnClickListener { onClick(-STEP) }
+        binding.btnPlus.setOnClickListener { onClick(STEP) }
+        binding.textView.isAllCaps = true // match appearance in controls
 
         return binding.root
-    }
-
-    private fun adjustSpeed(delta: BigDecimal) {
-        // Decimal arithmetic keeps repeated 0.10 steps free of floating-point drift.
-        val value = (number ?: DEFAULT_SPEED).toBigDecimal()
-        number = (value + delta).toDouble()
     }
 
     override fun isInteger(): Boolean = false
 
     override var number: Double?
-        set(v) {
-            val value = (v?.takeIf { it.isFinite() } ?: DEFAULT_SPEED).coerceIn(MINIMUM, MAXIMUM)
-            val decimal = value.toBigDecimal().stripTrailingZeros()
-            // Show at least two decimal places without rounding a manually entered speed.
-            binding.editText.setText(decimal.setScale(maxOf(2, decimal.scale())).toPlainString())
-        }
-        get() = binding.editText.text.toString().toDoubleOrNull()?.takeIf { it.isFinite() }
+        set(v) { binding.seekBar.progress = fromSpeed(v!!) }
+        get() = toSpeed(binding.seekBar.progress)
 }
