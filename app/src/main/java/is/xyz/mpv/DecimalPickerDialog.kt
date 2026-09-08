@@ -5,11 +5,9 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.view.LayoutInflater
 import android.view.View
-import java.math.BigDecimal
 
 internal class DecimalPickerDialog(
-    private val rangeMin: Double, private val rangeMax: Double,
-    private val step: Double = 1.0
+    private val rangeMin: Double, private val rangeMax: Double
 ) : PickerDialog {
     private lateinit var binding: DialogDecimalBinding
 
@@ -34,12 +32,10 @@ internal class DecimalPickerDialog(
         })
         val onClick = { delta: Double ->
             val value = this.number ?: 0.0
-            // Keep fractional steps exact instead of accumulating floating-point error.
-            this.number = BigDecimal.valueOf(value).add(BigDecimal.valueOf(delta))
-                .toDouble().coerceIn(rangeMin, rangeMax)
+            this.number = (value + delta).coerceIn(rangeMin, rangeMax)
         }
-        binding.btnMinus.setOnClickListener { onClick(-step) }
-        binding.btnPlus.setOnClickListener { onClick(step) }
+        binding.btnMinus.setOnClickListener { onClick(-STEP) }
+        binding.btnPlus.setOnClickListener { onClick(STEP) }
 
         return binding.root
     }
@@ -49,4 +45,8 @@ internal class DecimalPickerDialog(
     override var number: Double?
         set(v) = binding.editText.setText(v!!.toString())
         get() = binding.editText.text.toString().toDoubleOrNull()
+
+    companion object {
+        private const val STEP = 1.0
+    }
 }
