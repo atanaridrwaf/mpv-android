@@ -5,43 +5,18 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <LinearLayout
-        android:id="@+id/stepButtons"
+    <TextView
+        android:id="@+id/textView"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_alignParentTop="true"
         android:layout_centerHorizontal="true"
-        android:baselineAligned="false"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/btnMinus"
-            style="@style/Widget.AppCompat.Button.Borderless"
-            android:layout_width="48dp"
-            android:layout_height="wrap_content"
-            android:text="@string/btn_minus"
-            android:visibility="gone" />
-
-        <TextView
-            android:id="@+id/textView"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="8dp"
-            android:paddingBottom="8dp"
-            android:text=""
-            android:textAppearance="@style/TextAppearance.AppCompat.Body1"
-            android:textStyle="bold"
-            tools:text="1.00X" />
-
-        <Button
-            android:id="@+id/btnPlus"
-            style="@style/Widget.AppCompat.Button.Borderless"
-            android:layout_width="48dp"
-            android:layout_height="wrap_content"
-            android:text="@string/btn_plus"
-            android:visibility="gone" />
-    </LinearLayout>
+        android:paddingTop="8dp"
+        android:paddingBottom="8dp"
+        android:text=""
+        android:textAppearance="@style/TextAppearance.AppCompat.Body1"
+        android:textStyle="bold"
+        tools:text="123" />
 
     <Button
         android:id="@+id/resetBtn"
@@ -59,5 +34,6 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_below="@id/resetBtn" />
+
 
 </RelativeLayout>
